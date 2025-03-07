@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Math Study</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <div id="timer-overlay">Time remaining: 04:00</div>
+  <div class="console-wrapper">
+    <div id="console-left">
+      {% for line in lines_left %}
+        <div class="console-line">{{ line|safe }}</div>
+      {% endfor %}
+      <div class="input-line">
+        <span>$  </span><div id="taskInput" class="console-input" contenteditable="true" ></div>
+      </div>
+    </div>
+  </div>
+  <div class="divider"></div>
+  <div class="console-wrapper">
+    <div id="console-right">
+      {% for line in lines_right %}
+        <div class="console-line">{{ line|safe }}</div>
+      {% endfor %}
+      <div class="input-line">
+        <span>$  </span><div id="chatInput" class="console-input" contenteditable="true"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    class Timer {
+        constructor() {
+            this.overlay = document.getElementById("timer-overlay");
+            this.interval = null;
+            this.remainingTime = 0;
+        }
+
+        start(minutes, forceStart = false) {
+            if (this.interval && !forceStart) return;
+            
+            this.stop();
+            const duration = minutes * 60 * 1000;
+            const endTime = Date.now() + duration;
+            
+            this.overlay.style.display = 'block';
+            
+            const updateTimer = async () => {
+                this.remainingTime = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+                
+                if (this.remainingTime <= 0) {
+                    this.stop();
+                    const data = await leftConsole.sendInput("/command", "timeout");
+                    if (data.lines_left) leftConsole.update(data.lines_left);
+                    if (data.timer_duration > 0) {
+                        this.start(data.timer_duration, true);
+                    }
+                    return;
+                }
+                
+                const minutes = Math.floor(this.remainingTime / 60);
+                const seconds = this.remainingTime % 60;
+                const prefix = this.remainingTime > 30 ? "Question time" : "Certainty time";
+                this.overlay.textContent = `${prefix}: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            };
+
+            updateTimer();
+            this.interval = setInterval(updateTimer, 1000);
+        }
+
+        stop() {
+            if (this.interval) {
+                clearInterval(this.interval);
+                this.interval = null;
+            }
+            this.overlay.style.display = 'none';
+            this.remainingTime = 0;
+        }
+    }
+
+    class Console {
+      constructor(consoleId, inputId) {
+        this.console = document.getElementById(consoleId);
+        this.input = document.getElementById(inputId);
+      }
+
+      update(lines) {
+        const inputLine = this.console.querySelector(".input-line");
+        this.console.innerHTML = "";
+        lines.forEach(ln => {
+          const div = document.createElement("div");
+          div.className = "console-line";
+          div.innerHTML = ln;
+          this.console.appendChild(div);
+        });
+        this.console.appendChild(inputLine);
+        this.console.scrollTop = this.console.scrollHeight;
+        this.input.focus();
+      }
+
+      async sendInput(endpoint, input) {
+        const payload = {
+            input: typeof input === 'object' ? input.input : input,
+            message: typeof input === 'object' ? input.message : input,
+            remaining_time: timer.remainingTime || 0
+        };
+
+        const r = await fetch(endpoint, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        });
+        return r.json();
+      }
+    }
+
+    const leftConsole = new Console("console-left", "taskInput");
+    const rightConsole = new Console("console-right", "chatInput");
+    const timer = new Timer();
+
+    const handleInput = async (console, endpoint) => {
+        const text = console.input.innerText.trim();
+        console.input.innerText = "";
+        
+        try {
+            const data = await console.sendInput(endpoint, {
+                input: text,
+                message: text,
+                remaining_time: timer.remainingTime
+            });
+            
+            if (data.lines_right) rightConsole.update(data.lines_right);
+            if (data.lines_left) leftConsole.update(data.lines_left);
+            
+            if (console === leftConsole && data.timer_duration > 0) {
+                if (data.should_reset || !timer.interval) {
+                    timer.start(data.timer_duration, true);
+                }
+            }
+            
+            console.input.focus();
+        } catch(err) {
+            console.error(err);
+        }
+    };
+
+    const setupConsole = (console, endpoint) => {
+      console.input.addEventListener("keydown", e => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          handleInput(console, endpoint);
+        }
+      });
+      console.console.addEventListener("click", () => console.input.focus());
+    };
+
+    setupConsole(leftConsole, "/command");
+    setupConsole(rightConsole, "/chat");
+
+    if (document.getElementById("timer-overlay").style.display === 'block') {
+      timer.start();
+    }
+
+    document.getElementById("console-left").addEventListener("click", () => {
+      taskInputEl.focus();
+    });
+
+    document.getElementById("console-right").addEventListener("click", () => {
+      chatInputEl.focus();
+    });
+
+    fetch("/status").then(r => r.json()).then(data => {
+        if (data.timer_duration > 0) {
+            timer.start(data.timer_duration, true);
+        }
+    });
+  </script>
+</body>
+</html>

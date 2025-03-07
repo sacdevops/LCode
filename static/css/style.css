@@ -1,0 +1,72 @@
+body { 
+  margin: 0; 
+  display: flex; 
+  height: 100vh; 
+}
+
+.console-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#console-left, #console-right {
+  flex: 1;
+  background: black;
+  color: white;
+  font-family: monospace;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+#console-right {
+  padding: 60px 20px 20px;
+}
+
+.divider {
+  width: 2px;
+  background: white;
+}
+
+.console-line {
+  white-space: pre-wrap;
+}
+
+.input-line {
+  display: flex;
+  padding: 5px 0;
+}
+
+.console-input {
+  background: black;
+  border: none;
+  color: white;
+  font-family: monospace;
+  flex: 1;
+  outline: none;
+  margin-left: 5px;
+}
+
+#timer-overlay {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 5px;
+  font-family: monospace;
+  z-index: 1000;
+  border: 1px solid #fff;
+  display: none;
+}
+
+.user {
+  color: #66ff66;
+}
+
+.assistant {
+  color: #4da6ff;
+}
