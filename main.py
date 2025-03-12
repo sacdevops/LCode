@@ -465,7 +465,7 @@ def chat():
             {"role": "system", "content": "You are a helpful math assistant. Help the user solve the current question without directly giving the answer."},
             {"role": "user", "content": f"Current math question: {current_task['question']}\nUser question: {message}"}
         ],
-        max_tokens=1000,
+        max_tokens=100000,
         temperature=0
     )
     
