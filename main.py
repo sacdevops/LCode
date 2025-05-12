@@ -570,24 +570,10 @@ def chat():
     sm = SessionManager(session)
     current_task = load_tasks()[current_question_idx]
     
-<<<<<<< HEAD
     # Prepare content list starting with the question text
     content = [
         {"type": "text", "text": f"Current math question: {current_task['question']}\n\nUser question: {message}"}
     ]
-=======
-    current_task = session["tasks"][session["idx"]]
-    response = openai.chat.completions.create(
-        model=os.getenv('LLM_ENGINE', 'gpt-4o-mini'),
-        messages=[
-            {"role": "system", "content": "Use only UTF-8 text characters for your results. When you try to write math equations, use plain text instead of special code, e.g. • for \times or (25/5) instead of \frac{25}{5}."},
-            {"role": "system", "content": "You are a helpful math assistant. Help the user solve the current question without directly giving the answer."},
-            {"role": "user", "content": f"Current math question: {current_task['question']}\nUser question: {message}"}
-        ],
-        max_tokens=100000,
-        temperature=0
-    )
->>>>>>> c81cd97a2c8c31bbdb5ca8b93a19221f0a755e2b
     
     # Get image from cache using the key stored in session
     image_key = session.get("current_image_key")
