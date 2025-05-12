@@ -53,8 +53,7 @@
                     this.stop();
                     const data = await leftConsole.sendInput("/command", "timeout");
                     if (data.lines_left) leftConsole.update(data.lines_left);
-                    // Always update right console with empty lines when timeout occurs
-                    rightConsole.update(data.lines_right || []);
+                    // Don't update the right console when timeout occurs
                     if (data.timer_duration > 0) {
                         this.start(data.timer_duration, true);
                     }
@@ -146,21 +145,33 @@
                 remaining_time: timer.remainingTime
             });
             
+            // Update left console normally
+            if (data.lines_left) leftConsole.update(data.lines_left);
+            
+            // For the right console, only update it when:
+            // 1. It's a direct chat message
+            // 2. OR when a new question starts (idx changed)
             if (data.lines_right) {
                 if (console === rightConsole && endpoint === "/chat") {
+                    // For direct chat interactions, just append the new message
                     const llmResponse = data.lines_right[data.lines_right.length - 1];
                     console.appendLine(llmResponse);
-                } else {
+                } else if (data.new_question === true) {
+                    // Only do a full update on the right console for a new question
                     rightConsole.update(data.lines_right);
                 }
+                // For all other cases (timeout, answer submission, certainty), leave right console unchanged
             }
-            
-            if (data.lines_left) leftConsole.update(data.lines_left);
             
             if (console === leftConsole && data.timer_duration > 0) {
                 if (data.should_reset || !timer.interval) {
                     timer.start(data.timer_duration, true);
                 }
+            }
+            
+            // Update chat input disabled state based on certainty_pending
+            if (data.certainty_pending !== undefined) {
+                updateChatInputState(data.certainty_pending);
             }
             
             console.input.focus();
@@ -169,6 +180,20 @@
             console.appendLine("$ Error: Could not process your request.");
         }
     };
+
+    // Add new function to update chat input state
+    function updateChatInputState(certaintyPending) {
+        const chatInput = document.getElementById("chatInput");
+        if (certaintyPending) {
+            chatInput.setAttribute("contenteditable", "false");
+            chatInput.style.opacity = "0.5";
+            chatInput.style.cursor = "not-allowed";
+        } else {
+            chatInput.setAttribute("contenteditable", "true");
+            chatInput.style.opacity = "1";
+            chatInput.style.cursor = "text";
+        }
+    }
 
     const setupConsole = (console, endpoint) => {
       console.input.addEventListener("keydown", e => {
@@ -201,6 +226,11 @@
         } else if (data.phase === "summary") {
             // Make sure timer is hidden for summary
             timer.stop();
+        }
+        
+        // Initialize chat input state based on certainty_pending
+        if (data.certainty_pending !== undefined) {
+            updateChatInputState(data.certainty_pending);
         }
     });
   </script>

@@ -35,9 +35,6 @@ cache = {
     "tasks": None,  # Will store all tasks
 }
 
-# Maximum lines to store in console history to prevent session bloat
-MAX_CONSOLE_LINES = 20
-
 # Pre-configure WebDAV client for faster connections
 webdav_options = {
     'webdav_hostname': os.getenv('SCIEBO_URL'),
@@ -160,23 +157,21 @@ def prepare_options(task):
     return final
 
 def cache_image(task_idx, image_path):
-    """Cache an image as base64 for a given task"""
+    """Cache an image as base64 for a given task, replacing any previously cached image"""
     if not image_path:
         return None
         
-    # If already cached, return the key
-    cache_key = f"task_{task_idx}_image"
-    if cache_key in cache["images"]:
-        return cache_key
-        
+    # Use a constant key for current task image
+    cache_key = "current_task_image"
+    
     img_path = os.path.join("static", "img", image_path + ".jpg")
     if os.path.exists(img_path):
         try:
             with open(img_path, "rb") as img_file:
                 image_data = img_file.read()
                 base64_image = base64.b64encode(image_data).decode('utf-8')
-                cache["images"][cache_key] = base64_image
-                print(f"Successfully cached image for task {task_idx+1}")
+                # Replace any existing cached image with the current one
+                cache["images"] = {cache_key: base64_image}
                 return cache_key
         except Exception as e:
             print(f"Error caching image: {str(e)}")
@@ -223,16 +218,10 @@ class SessionManager:
     def append_left(self, txt):
         lines = self.session["lines_left"]
         lines.append(txt)
-        # Keep only recent lines to reduce session size
-        if len(lines) > MAX_CONSOLE_LINES:
-            self.session["lines_left"] = lines[-MAX_CONSOLE_LINES:]
     
     def append_right(self, txt):
         lines = self.session["lines_right"]
         lines.append(txt)
-        # Keep only recent lines to reduce session size
-        if len(lines) > MAX_CONSOLE_LINES:
-            self.session["lines_right"] = lines[-MAX_CONSOLE_LINES:]
     
     def reset(self):
         self.session.clear()
@@ -457,8 +446,9 @@ class InputHandler:
             self.sm.clear_console()
             self.qm.show_summary()
         else:
-            self.sm.clear_console()
-            # Explicitly make sure the right console is properly cleared
+            # Only clear the left console
+            self.sm.session["lines_left"] = []
+            # Only clear the right console when moving to a new question
             self.sm.session["lines_right"] = []
             self.qm.show_question()
 
@@ -517,7 +507,9 @@ def status():
     return jsonify({
         "timer_duration": timer_duration,
         "should_reset": True,
-        "question_idx": session["idx"]
+        "question_idx": session["idx"],
+        "certainty_pending": session.get("certainty_pending", False),
+        "phase": session["phase"]
     })
 
 @app.route("/command", methods=["POST"])
@@ -528,12 +520,17 @@ def command():
     user_input = str(user_input).strip()
     
     was_certainty_pending = session.get("certainty_pending", False)
+    previous_idx = session.get("idx", 0)
     
     ih = InputHandler(SessionManager(session))
     ih.handle(user_input)
     
     timer_duration = 0
     should_reset = False
+    current_idx = session.get("idx", 0)
+    
+    # Check if we've moved to a new question
+    new_question = (previous_idx != current_idx and not session.get("certainty_pending", False))
     
     if session["phase"] == "questions":
         current_certainty_pending = session.get("certainty_pending", False)
@@ -547,12 +544,13 @@ def command():
             timer_duration = CERTAINTY_TIME_SECONDS / 60
             should_reset = (not was_certainty_pending) or user_input == "timeout"
     
-    # Ensure that right console is always properly included in response
     return jsonify({
         "lines_left": session["lines_left"],
         "lines_right": session["lines_right"],
         "timer_duration": timer_duration,
-        "should_reset": should_reset
+        "should_reset": should_reset,
+        "certainty_pending": session.get("certainty_pending", False),
+        "new_question": new_question
     })
 
 @app.route("/chat", methods=["POST"])
@@ -592,8 +590,10 @@ def chat():
         response = openai_client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
+                {"role": "system", "content": "You are a math assistant that helps with the current math problem. For math-related questions, help guide the user toward solving the problem without directly giving the answer."},
+                {"role": "system", "content": "If the user asks questions that are not related to the current math problem, respond only with something like: 'I'm sorry, but I can only help with the current math problem' or with a small math joke when it's appropriate, but don't continue with the explaination of the task then. Do not elaborate further on off-topic questions. Don't write anything to the task than."},
+                {"role": "system", "content": "If the user is writing something like 'Hello' or 'How are you?', respond with: 'Hello, how I can help you with your math problem?'"},
                 {"role": "system", "content": "Use only UTF-8 text characters for your results. When you try to write math equations, use plain text instead of special code, e.g. • for \\times or (25/5) instead of \\frac{25}{5}."},
-                {"role": "system", "content": "You are a math assistant that helps with the current math problem. If the user asks questions that are not related to the current math problem, respond only with: 'I'm sorry, but I can only help with the current math problem.' Do not elaborate further on off-topic questions. For math-related questions, help guide the user toward solving the problem without directly giving the answer."},
                 {"role": "user", "content": content}
             ],
             max_tokens=1000,
