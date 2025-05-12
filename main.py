@@ -6,18 +6,54 @@ import secrets
 import random
 import openai
 import json
+import base64
+from dotenv import load_dotenv
 from webdav3.client import Client
+from config import NUM_ANSWERS, CERTAINTY_TIME_SECONDS, QUESTION_TIME_SECONDS
+
+# Load environment variables
+load_dotenv()
+
+# Initialize the API key and model name once at startup
+api_key = os.getenv('OPENAI_API_KEY')
+if not api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
+    
+LLM_MODEL = os.getenv('LLM_ENGINE', 'gpt-4.1-mini')
+
+# Create the OpenAI client once
+openai_client = openai.OpenAI(api_key=api_key)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 app.config["SESSION_PERMANENT"] = False
-openai.api_key = os.getenv('OPENAI_API_KEY')
+
+# Server-side cache for storing images and other large data
+# This keeps data out of the session cookie
+cache = {
+    "images": {},  # Will store image data by task_id
+    "tasks": None,  # Will store all tasks
+}
+
+# Maximum lines to store in console history to prevent session bloat
+MAX_CONSOLE_LINES = 20
+
+# Pre-configure WebDAV client for faster connections
+webdav_options = {
+    'webdav_hostname': os.getenv('SCIEBO_URL'),
+    'webdav_login': os.getenv('SCIEBO_LOGIN'),
+    'webdav_password': os.getenv('SCIEBO_PASSWORD'),
+    'connect_timeout': 10,
+    'read_timeout': 30
+}
+webdav_client = Client(webdav_options)
 
 class RecordKeeper:
     def __init__(self, session):
         self.session = session
         
     def start_task_record(self, task_idx, task, options):
+        # Store only necessary data
         self.session["record_data"]["current_task"] = {
             "task_index": task_idx,
             "question": task["question"],
@@ -70,19 +106,14 @@ class RecordKeeper:
             
             os.makedirs("results", exist_ok=True)
             
+            # Write file with minimal indent for faster processing
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(final_data, indent=2, ensure_ascii=False, fp=f)
+                json.dump(final_data, ensure_ascii=False, fp=f)
 
-            options = {
-                'webdav_hostname': os.getenv('SCIEBO_URL'),
-                'webdav_login': os.getenv('SCIEBO_LOGIN'),
-                'webdav_password': os.getenv('SCIEBO_PASSWORD')
-            }
-            client = Client(options)
-            
+            # Use the pre-configured WebDAV client for faster upload
             remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
             
-            client.upload_file(
+            webdav_client.upload_file(
                 remote_path=remote_path,
                 local_path=filepath
             )
@@ -92,25 +123,69 @@ class RecordKeeper:
         except Exception as e:
             print(f"Error saving/uploading results: {str(e)}")
 
-class TaskLoader:
-    def __init__(self, csv_file):
-        self.csv_file = csv_file
-    
-    def load(self):
+def load_tasks():
+    """Load tasks once and cache them to avoid repeated file operations"""
+    if cache["tasks"] is None:
         result = []
-        with open(self.csv_file, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f, delimiter=";")
-            for row in reader:
-                task = {
-                    "question": row["question"].strip(),
-                    "options": [x.strip() for x in row["options"].split(";")],
-                    "correct_solution": row["correct_solution"].strip(),
-                    "image_path": row.get("image_path", "").strip()
-                }
-                if task["correct_solution"] not in task["options"]:
-                    task["options"].append(task["correct_solution"])
-                result.append(task)
-        return result
+        csv_file = os.path.join("data", "tasks.csv")
+        try:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=";")
+                for row in reader:
+                    task = {
+                        "question": row["question"].strip(),
+                        "options": [x.strip() for x in row["options"].split(";")],
+                        "correct_solution": row["correct_solution"].strip(),
+                        "image_path": row.get("image_path", "").strip()
+                    }
+                    if task["correct_solution"] not in task["options"]:
+                        task["options"].append(task["correct_solution"])
+                    result.append(task)
+            cache["tasks"] = result
+        except Exception as e:
+            print(f"Error loading tasks: {e}")
+            cache["tasks"] = []
+    return cache["tasks"]
+
+def prepare_options(task):
+    """Prepare randomized options for a task"""
+    options = task['options'].copy()
+    correct = task['correct_solution']
+    if correct in options:
+        options.remove(correct)
+    random.shuffle(options)
+    selected = options[:NUM_ANSWERS-1]
+    final = selected + [correct]
+    random.shuffle(final)
+    return final
+
+def cache_image(task_idx, image_path):
+    """Cache an image as base64 for a given task"""
+    if not image_path:
+        return None
+        
+    # If already cached, return the key
+    cache_key = f"task_{task_idx}_image"
+    if cache_key in cache["images"]:
+        return cache_key
+        
+    img_path = os.path.join("static", "img", image_path + ".jpg")
+    if os.path.exists(img_path):
+        try:
+            with open(img_path, "rb") as img_file:
+                image_data = img_file.read()
+                base64_image = base64.b64encode(image_data).decode('utf-8')
+                cache["images"][cache_key] = base64_image
+                print(f"Successfully cached image for task {task_idx+1}")
+                return cache_key
+        except Exception as e:
+            print(f"Error caching image: {str(e)}")
+    
+    return None
+
+def get_cached_image(cache_key):
+    """Get a cached image by key"""
+    return cache["images"].get(cache_key)
 
 class SessionManager:
     def __init__(self, session):
@@ -122,15 +197,14 @@ class SessionManager:
             "phase": "prolific",
             "lines_left": [],
             "lines_right": [],
-            "tasks": TaskLoader(os.path.join("data", "tasks.csv")).load(),
             "idx": 0,
             "results": [],
-            "num_answers": 4,
             "start_time": None,
             "prolific_id": None,
             "certainty_pending": False,
             "current_result": None,
-            "intervention_group": random.choice([True, False])
+            "intervention_group": random.choice([True, False]),
+            "current_image_key": None,  # Store the key to cached image instead of the image itself
         }
         for key, value in defaults.items():
             if key not in self.session:
@@ -147,10 +221,18 @@ class SessionManager:
         self.session["lines_right"] = []
     
     def append_left(self, txt):
-        self.session["lines_left"].append(txt)
+        lines = self.session["lines_left"]
+        lines.append(txt)
+        # Keep only recent lines to reduce session size
+        if len(lines) > MAX_CONSOLE_LINES:
+            self.session["lines_left"] = lines[-MAX_CONSOLE_LINES:]
     
     def append_right(self, txt):
-        self.session["lines_right"].append(txt)
+        lines = self.session["lines_right"]
+        lines.append(txt)
+        # Keep only recent lines to reduce session size
+        if len(lines) > MAX_CONSOLE_LINES:
+            self.session["lines_right"] = lines[-MAX_CONSOLE_LINES:]
     
     def reset(self):
         self.session.clear()
@@ -162,7 +244,7 @@ class QuestionManager:
     
     def show_question(self):
         i = self.sm.session["idx"]
-        tlist = self.sm.session["tasks"]
+        tlist = load_tasks()  # Load from cache
         if i >= len(tlist):
             self.sm.session["phase"] = "summary"
             self.sm.clear_console()
@@ -171,15 +253,24 @@ class QuestionManager:
         self.sm.session["start_time"] = time.time()
         t = tlist[i]
         
+        # First display the question number
+        self.sm.append_left(f"$  QUESTION {i+1}/{len(tlist)}\n")
+        
+        # Cache the image and store only the reference key in the session
+        self.sm.session["current_image_key"] = None  # Reset previous image cache
         if t["image_path"]:
             img_path = os.path.join("static", "img", t["image_path"] + ".jpg")
             if os.path.exists(img_path):
+                # Display the image in the UI
                 self.sm.append_left(f"""<img src="static/img/{t['image_path']}.jpg" style="width:400px;">""")
+                
+                # Cache the image and store only the key in session
+                self.sm.session["current_image_key"] = cache_image(i, t["image_path"])
         
-        self.sm.append_left(f"$  QUESTION {i+1}/{len(tlist)}\n")
+        # Then display the question text
         self.sm.append_left(f"   {t['question']}")
         
-        options = self.prepare_options(t)
+        options = prepare_options(t)
         self.sm.session['current_options'] = options
         
         if "record_data" not in self.sm.session:
@@ -189,29 +280,29 @@ class QuestionManager:
             }
         self.sm.record_keeper.start_task_record(i, t, options)
         
+        # Finally display the answer options
         for x, op in enumerate(options):
             self.sm.append_left(f"   {chr(ord('a') + x)}) {op}")
         
         self.sm.append_left("$  Type a letter and press ENTER.")
-    
-    def prepare_options(self, task):
-        options = task['options'].copy()
-        correct = task['correct_solution']
-        if correct in options:
-            options.remove(correct)
-        random.shuffle(options)
-        selected = options[:self.sm.session["num_answers"]-1]
-        final = selected + [correct]
-        random.shuffle(final)
-        return final
     
     def show_summary(self):
         rs = self.sm.session["results"]
         stats = self.calculate_stats(rs)
         self.sm.record_keeper.save_and_send(stats)
         
+        # Add thank you message at the beginning
+        self.sm.append_left("$  Thank you for participating in our study!")
+        self.sm.append_left("$  Below are your results from the math problem-solving session:")
+        self.sm.append_left("$")
+        
         self.sm.append_left(self.generate_summary_table(rs, stats))
         self.sm.append_left(self.generate_summary_footer(stats))
+        
+        # Add closing message
+        self.sm.append_left("$")
+        self.sm.append_left("$  Your participation is greatly appreciated. You may now close this window.")
+        self.sm.append_left("$  Please return to Prolific to complete your submission.")
     
     def calculate_stats(self, results):
         return {
@@ -256,7 +347,6 @@ class InputHandler:
                 "phase": "questions",
                 "idx": 0,
                 "results": [],
-                "num_answers": 4,
                 "certainty_pending": False
             })
             self.sm.clear_console()
@@ -276,7 +366,8 @@ class InputHandler:
             return
             
         i = self.sm.session["idx"]
-        if i >= len(self.sm.session["tasks"]):
+        tasks = load_tasks()
+        if i >= len(tasks):
             self.end_questions()
             return
             
@@ -292,10 +383,10 @@ class InputHandler:
     
     def process_answer(self, u):
         self.sm.record_keeper.add_user_input(u)
-        t = self.sm.session["tasks"][self.sm.session["idx"]]
+        t = load_tasks()[self.sm.session["idx"]]
         spent = time.time() - self.sm.session["start_time"] if self.sm.session["start_time"] else 0
         
-        if u == "timeout" or spent >= 240:
+        if u == "timeout" or spent >= QUESTION_TIME_SECONDS:
             return self.handle_timeout(t, spent)
             
         if not self.is_valid_answer(u):
@@ -305,7 +396,7 @@ class InputHandler:
         self.ask_certainty()
     
     def is_valid_answer(self, u):
-        allowed_letters = [chr(ord('a') + x) for x in range(self.sm.session["num_answers"])]
+        allowed_letters = [chr(ord('a') + x) for x in range(NUM_ANSWERS)]
         if u not in allowed_letters:
             self.sm.append_left("$  Invalid letter.")
             return False
@@ -318,12 +409,9 @@ class InputHandler:
             "chosen_option": "TIMEOUT",
             "correct_option": task["correct_solution"],
             "is_correct": False,
-            "time_spent": 240
+            "time_spent": QUESTION_TIME_SECONDS
         }
-        if self.sm.session["intervention_group"]:
-            self.sm.session["num_answers"] = max(2, self.sm.session["num_answers"] - 1) if random.random() < 0.5 else min(10, self.sm.session["num_answers"] + 1)
-        else:
-            self.sm.session["num_answers"] = max(2, self.sm.session["num_answers"] - 1)
+        
         self.sm.session["certainty_pending"] = True
         self.ask_certainty()
 
@@ -332,14 +420,6 @@ class InputHandler:
         chosen = self.sm.session['current_options'][answer_idx]
         correct = (chosen == task["correct_solution"])
 
-        if self.sm.session["intervention_group"]:
-            self.sm.session["num_answers"] = max(2, self.sm.session["num_answers"] - 1) if random.random() < 0.5 else min(10, self.sm.session["num_answers"] + 1)
-        else:
-            if correct:
-                self.sm.session["num_answers"] = min(10, self.sm.session["num_answers"] + 1)
-            else:
-                self.sm.session["num_answers"] = max(2, self.sm.session["num_answers"] - 1)
-
         self.sm.session["current_result"] = {
             "question": task["question"],
             "chosen_option": chosen,
@@ -347,10 +427,11 @@ class InputHandler:
             "is_correct": correct,
             "time_spent": spent
         }
-
+        
     def ask_certainty(self):
         self.sm.session["certainty_pending"] = True
         self.sm.append_left("\n$  How certain are you about your decision?")
+        self.sm.append_left("\n$  Type a digit from 1 to 4 and press ENTER:")
         self.sm.append_left("   1) uncertain")
         self.sm.append_left("   2) rather uncertain")
         self.sm.append_left("   3) rather certain")
@@ -371,12 +452,14 @@ class InputHandler:
 
     def advance_question(self):
         self.sm.session["idx"] += 1
-        if self.sm.session["idx"] >= len(self.sm.session["tasks"]):
+        if self.sm.session["idx"] >= len(load_tasks()):
             self.sm.session["phase"] = "summary"
             self.sm.clear_console()
             self.qm.show_summary()
         else:
             self.sm.clear_console()
+            # Explicitly make sure the right console is properly cleared
+            self.sm.session["lines_right"] = []
             self.qm.show_question()
 
     def end_questions(self):
@@ -388,13 +471,34 @@ class InputHandler:
 def before():
     session.permanent = False
     SessionManager(session).init_state()
+    # Pre-load tasks to make sure they're cached
+    load_tasks()
 
 @app.route("/")
 def home():
     sm = SessionManager(session)
     if session["phase"] == "prolific" and not session["lines_left"]:
         sm.clear_console()
-        sm.append_left("$  Enter your Prolific ID to begin:")
+        sm.append_left("$  Welcome to the Math Problem Solving Study!")
+        sm.append_left("$")
+        sm.append_left("$  In this study, you will be asked to solve a series of math problems.")
+        sm.append_left("$  Some participants will have access to an AI assistant in the right panel")
+        sm.append_left("$  that can provide guidance (but not direct answers).")
+        sm.append_left("$")
+        # Display time in seconds or minutes appropriately
+        if QUESTION_TIME_SECONDS < 60:
+            sm.append_left(f"$  You will have {QUESTION_TIME_SECONDS} seconds to solve each problem.")
+        else:
+            minutes = QUESTION_TIME_SECONDS // 60
+            seconds = QUESTION_TIME_SECONDS % 60
+            time_str = f"{minutes} minute{'s' if minutes > 1 else ''}"
+            if seconds:
+                time_str += f" and {seconds} second{'s' if seconds > 1 else ''}"
+            sm.append_left(f"$  You will have {time_str} to solve each problem.")
+        
+        sm.append_left("$  After submitting your answer, you'll be asked to rate your confidence.")
+        sm.append_left("$")
+        sm.append_left("$  Please enter your Prolific ID to begin:")
     return render_template("console.html", 
                          lines_left=session["lines_left"], 
                          lines_right=session["lines_right"],
@@ -405,12 +509,15 @@ def status():
     timer_duration = 0
     if session["phase"] == "questions":
         if not session["certainty_pending"]:
-            timer_duration = 1
+            # Convert seconds to minutes for the timer
+            timer_duration = QUESTION_TIME_SECONDS / 60
         else:
-            timer_duration = 0.5
+            # Convert seconds to minutes for the timer
+            timer_duration = CERTAINTY_TIME_SECONDS / 60
     return jsonify({
         "timer_duration": timer_duration,
-        "should_reset": True
+        "should_reset": True,
+        "question_idx": session["idx"]
     })
 
 @app.route("/command", methods=["POST"])
@@ -432,12 +539,15 @@ def command():
         current_certainty_pending = session.get("certainty_pending", False)
         
         if not current_certainty_pending:
-            timer_duration = 1
+            # Convert seconds to minutes for the timer
+            timer_duration = QUESTION_TIME_SECONDS / 60
             should_reset = was_certainty_pending or user_input == "timeout"
         else:
-            timer_duration = 0.5
+            # Convert seconds to minutes for the timer
+            timer_duration = CERTAINTY_TIME_SECONDS / 60
             should_reset = (not was_certainty_pending) or user_input == "timeout"
-            
+    
+    # Ensure that right console is always properly included in response
     return jsonify({
         "lines_left": session["lines_left"],
         "lines_right": session["lines_right"],
@@ -451,30 +561,64 @@ def chat():
         return jsonify({"lines_right": session["lines_right"]})
     
     message = request.json.get("message", "").strip()
+    current_question_idx = session["idx"]  # Use the current index directly
+    
+    # Validate if the message is empty
     if not message:
         return jsonify({"lines_right": session["lines_right"]})
     
     sm = SessionManager(session)
-    sm.append_right(f"<span class='user'>User: {message}</span>")
+    current_task = load_tasks()[current_question_idx]
     
-    current_task = session["tasks"][session["idx"]]
-    response = openai.chat.completions.create(
-        model=os.getenv('LLM_ENGINE', 'gpt-4o-mini'),
-        messages=[
-            {"role": "system", "content": "Use only UTF-8 text characters for your results. When you try to write math equations, use plain text instead of special code, e.g. • for \times or (25/5) instead of \frac{25}{5}."},
-            {"role": "system", "content": "You are a helpful math assistant. Help the user solve the current question without directly giving the answer."},
-            {"role": "user", "content": f"Current math question: {current_task['question']}\nUser question: {message}"}
-        ],
-        max_tokens=1000,
-        temperature=0
-    )
+    # Prepare content list starting with the question text
+    content = [
+        {"type": "text", "text": f"Current math question: {current_task['question']}\n\nUser question: {message}"}
+    ]
     
-    assistant_response = response.choices[0].message.content
-    sm.append_right(f"<span class='assistant'>Assistant: {assistant_response}</span>")
+    # Get image from cache using the key stored in session
+    image_key = session.get("current_image_key")
+    if image_key:
+        base64_image = get_cached_image(image_key)
+        if base64_image:
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_image}"
+                }
+            })
+    
+    try:
+        # Use the global OpenAI client and model
+        response = openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "Use only UTF-8 text characters for your results. When you try to write math equations, use plain text instead of special code, e.g. • for \\times or (25/5) instead of \\frac{25}{5}."},
+                {"role": "system", "content": "You are a math assistant that helps with the current math problem. If the user asks questions that are not related to the current math problem, respond only with: 'I'm sorry, but I can only help with the current math problem.' Do not elaborate further on off-topic questions. For math-related questions, help guide the user toward solving the problem without directly giving the answer."},
+                {"role": "user", "content": content}
+            ],
+            max_tokens=1000,
+            temperature=0
+        )
+        
+        assistant_response = response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI API error: {str(e)}")
+        assistant_response = f"I apologize, but I encountered an error processing your request: {str(e)}"
+    
+    # Format the assistant's response with HTML
+    formatted_response = f"<span class='assistant'>Assistant: {assistant_response}</span>"
+    
+    # Add to session
+    sm.append_right(formatted_response)
+    
+    # Add to history record
     sm.record_keeper.add_chat_interaction(message, assistant_response)
     
+    # Return the updated right console lines and the latest response
     return jsonify({
-        "lines_right": session["lines_right"]
+        "lines_right": session["lines_right"],
+        "latest_response": formatted_response,
+        "question_idx": current_question_idx
     })
 
 if __name__ == "__main__":

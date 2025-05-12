@@ -53,6 +53,8 @@
                     this.stop();
                     const data = await leftConsole.sendInput("/command", "timeout");
                     if (data.lines_left) leftConsole.update(data.lines_left);
+                    // Always update right console with empty lines when timeout occurs
+                    rightConsole.update(data.lines_right || []);
                     if (data.timer_duration > 0) {
                         this.start(data.timer_duration, true);
                     }
@@ -99,6 +101,14 @@
         this.input.focus();
       }
 
+      appendLine(text) {
+        const div = document.createElement("div");
+        div.className = "console-line";
+        div.innerHTML = text;
+        this.console.insertBefore(div, this.console.querySelector(".input-line"));
+        this.console.scrollTop = this.console.scrollHeight;
+      }
+
       async sendInput(endpoint, input) {
         const payload = {
             input: typeof input === 'object' ? input.input : input,
@@ -121,7 +131,13 @@
 
     const handleInput = async (console, endpoint) => {
         const text = console.input.innerText.trim();
+        if (!text) return;
+        
         console.input.innerText = "";
+        
+        if (console === rightConsole && endpoint === "/chat") {
+            console.appendLine(`$ ${text}`);
+        }
         
         try {
             const data = await console.sendInput(endpoint, {
@@ -130,7 +146,15 @@
                 remaining_time: timer.remainingTime
             });
             
-            if (data.lines_right) rightConsole.update(data.lines_right);
+            if (data.lines_right) {
+                if (console === rightConsole && endpoint === "/chat") {
+                    const llmResponse = data.lines_right[data.lines_right.length - 1];
+                    console.appendLine(llmResponse);
+                } else {
+                    rightConsole.update(data.lines_right);
+                }
+            }
+            
             if (data.lines_left) leftConsole.update(data.lines_left);
             
             if (console === leftConsole && data.timer_duration > 0) {
@@ -142,6 +166,7 @@
             console.input.focus();
         } catch(err) {
             console.error(err);
+            console.appendLine("$ Error: Could not process your request.");
         }
     };
 
@@ -163,16 +188,19 @@
     }
 
     document.getElementById("console-left").addEventListener("click", () => {
-      taskInputEl.focus();
+      leftConsole.input.focus();  // Fix: use leftConsole.input instead of undefined taskInputEl
     });
 
     document.getElementById("console-right").addEventListener("click", () => {
-      chatInputEl.focus();
+      rightConsole.input.focus();  // Fix: use rightConsole.input instead of undefined chatInputEl
     });
 
     fetch("/status").then(r => r.json()).then(data => {
         if (data.timer_duration > 0) {
             timer.start(data.timer_duration, true);
+        } else if (data.phase === "summary") {
+            // Make sure timer is hidden for summary
+            timer.stop();
         }
     });
   </script>
