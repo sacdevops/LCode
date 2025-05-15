@@ -35,12 +35,14 @@
             this.overlay = document.getElementById("timer-overlay");
             this.interval = null;
             this.remainingTime = 0;
+            this.phase = "question";
         }
 
-        start(minutes, forceStart = false) {
+        start(minutes, forceStart = false, phase = "question") {
             if (this.interval && !forceStart) return;
             
             this.stop();
+            this.phase = phase;
             const duration = minutes * 60 * 1000;
             const endTime = Date.now() + duration;
             
@@ -53,16 +55,17 @@
                     this.stop();
                     const data = await leftConsole.sendInput("/command", "timeout");
                     if (data.lines_left) leftConsole.update(data.lines_left);
-                    // Don't update the right console when timeout occurs
                     if (data.timer_duration > 0) {
-                        this.start(data.timer_duration, true);
+                        this.start(data.timer_duration, true, data.waiting_phase ? "waiting" : 
+                                                               data.certainty_pending ? "certainty" : "question");
                     }
                     return;
                 }
                 
                 const minutes = Math.floor(this.remainingTime / 60);
                 const seconds = this.remainingTime % 60;
-                const prefix = this.remainingTime > 30 ? "Question time" : "Certainty time";
+                
+                let prefix = "Time remaining"
                 this.overlay.textContent = `${prefix}: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
             };
 
@@ -127,6 +130,7 @@
     const leftConsole = new Console("console-left", "taskInput");
     const rightConsole = new Console("console-right", "chatInput");
     const timer = new Timer();
+    let waitingPhaseChecker = null;
 
     const handleInput = async (console, endpoint) => {
         const text = console.input.innerText.trim();
@@ -145,33 +149,34 @@
                 remaining_time: timer.remainingTime
             });
             
-            // Update left console normally
             if (data.lines_left) leftConsole.update(data.lines_left);
             
-            // For the right console, only update it when:
-            // 1. It's a direct chat message
-            // 2. OR when a new question starts (idx changed)
             if (data.lines_right) {
                 if (console === rightConsole && endpoint === "/chat") {
-                    // For direct chat interactions, just append the new message
                     const llmResponse = data.lines_right[data.lines_right.length - 1];
                     console.appendLine(llmResponse);
                 } else if (data.new_question === true) {
-                    // Only do a full update on the right console for a new question
                     rightConsole.update(data.lines_right);
                 }
-                // For all other cases (timeout, answer submission, certainty), leave right console unchanged
             }
             
-            if (console === leftConsole && data.timer_duration > 0) {
+            if (data.phase === "summary") {
+                timer.stop();
+            } else if (console === leftConsole && data.timer_duration > 0) {
                 if (data.should_reset || !timer.interval) {
-                    timer.start(data.timer_duration, true);
+                    const phase = data.waiting_phase ? "waiting" : 
+                                  data.certainty_pending ? "certainty" : "question";
+                    timer.start(data.timer_duration, true, phase);
                 }
             }
             
-            // Update chat input disabled state based on certainty_pending
-            if (data.certainty_pending !== undefined) {
-                updateChatInputState(data.certainty_pending);
+            updateInputStates(data.waiting_phase, data.certainty_pending, data.phase);
+            
+            if (data.waiting_phase) {
+                setupWaitingPhaseChecker();
+            } else if (waitingPhaseChecker) {
+                clearTimeout(waitingPhaseChecker);
+                waitingPhaseChecker = null;
             }
             
             console.input.focus();
@@ -181,17 +186,65 @@
         }
     };
 
-    // Add new function to update chat input state
-    function updateChatInputState(certaintyPending) {
+    function setupWaitingPhaseChecker() {
+        if (waitingPhaseChecker) {
+            clearTimeout(waitingPhaseChecker);
+        }
+        
+        waitingPhaseChecker = setTimeout(async () => {
+            try {
+                const response = await fetch("/status");
+                const data = await response.json();
+                
+                if (data.waiting_phase) {
+                    waitingPhaseChecker = setTimeout(setupWaitingPhaseChecker, 1000);
+                } else {
+                    const commandData = await leftConsole.sendInput("/command", "");
+                    
+                    if (commandData.lines_left) {
+                        leftConsole.update(commandData.lines_left);
+                    }
+                    if (commandData.lines_right) {
+                        rightConsole.update(commandData.lines_right);
+                    }
+                    
+                    updateInputStates(false, commandData.certainty_pending, data.phase);
+                    
+                    if (commandData.timer_duration > 0) {
+                        timer.start(commandData.timer_duration, true);
+                    }
+                    
+                    clearTimeout(waitingPhaseChecker);
+                    waitingPhaseChecker = null;
+                }
+            } catch (error) {
+                console.error("Error checking waiting phase status:", error);
+                waitingPhaseChecker = setTimeout(setupWaitingPhaseChecker, 2000);
+            }
+        }, 1000);
+    }
+
+    function updateInputStates(waitingPhase, certaintyPending, currentPhase) {
         const chatInput = document.getElementById("chatInput");
-        if (certaintyPending) {
+        const taskInput = document.getElementById("taskInput");
+        
+        if (waitingPhase || certaintyPending || currentPhase === "summary") {
             chatInput.setAttribute("contenteditable", "false");
             chatInput.style.opacity = "0.5";
             chatInput.style.cursor = "not-allowed";
+            
+            const disableTaskInput = waitingPhase || currentPhase === "summary";
+            taskInput.setAttribute("contenteditable", disableTaskInput ? "false" : "true");
+            taskInput.style.opacity = disableTaskInput ? "0.5" : "1";
+            taskInput.style.cursor = disableTaskInput ? "not-allowed" : "text";
         } else {
             chatInput.setAttribute("contenteditable", "true");
             chatInput.style.opacity = "1";
             chatInput.style.cursor = "text";
+            
+            taskInput.setAttribute("contenteditable", "true");
+            taskInput.style.opacity = "1";
+            taskInput.style.cursor = "text";
         }
     }
 
@@ -199,10 +252,16 @@
       console.input.addEventListener("keydown", e => {
         if (e.key === "Enter") {
           e.preventDefault();
-          handleInput(console, endpoint);
+          if (console.input.getAttribute("contenteditable") === "true") {
+            handleInput(console, endpoint);
+          }
         }
       });
-      console.console.addEventListener("click", () => console.input.focus());
+      console.console.addEventListener("click", () => {
+        if (console.input.getAttribute("contenteditable") === "true") {
+          console.input.focus();
+        }
+      });
     };
 
     setupConsole(leftConsole, "/command");
@@ -213,24 +272,30 @@
     }
 
     document.getElementById("console-left").addEventListener("click", () => {
-      leftConsole.input.focus();  // Fix: use leftConsole.input instead of undefined taskInputEl
+      if (leftConsole.input.getAttribute("contenteditable") === "true") {
+        leftConsole.input.focus();
+      }
     });
 
     document.getElementById("console-right").addEventListener("click", () => {
-      rightConsole.input.focus();  // Fix: use rightConsole.input instead of undefined chatInputEl
+      if (rightConsole.input.getAttribute("contenteditable") === "true") {
+        rightConsole.input.focus();
+      }
     });
 
     fetch("/status").then(r => r.json()).then(data => {
         if (data.timer_duration > 0) {
-            timer.start(data.timer_duration, true);
+            const phase = data.waiting_phase ? "waiting" : 
+                          data.certainty_pending ? "certainty" : "question";
+            timer.start(data.timer_duration, true, phase);
         } else if (data.phase === "summary") {
-            // Make sure timer is hidden for summary
             timer.stop();
         }
         
-        // Initialize chat input state based on certainty_pending
-        if (data.certainty_pending !== undefined) {
-            updateChatInputState(data.certainty_pending);
+        updateInputStates(data.waiting_phase, data.certainty_pending, data.phase);
+        
+        if (data.waiting_phase) {
+            setupWaitingPhaseChecker();
         }
     });
   </script>

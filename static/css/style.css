@@ -67,8 +67,11 @@ body {
   color: #4da6ff;
 }
 
-/* Style for the thank you message in summary */
 .console-line:first-child {
-  font-weight: bold;
-  margin-bottom: 5px;
+  font-weight: 900;
+}
+
+.task-img {
+  width: 400px;
+  margin: 10px 0;
 }
