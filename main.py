@@ -106,14 +106,47 @@ class RecordKeeper:
 
             remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
             
-            webdav_client.upload_file(
-                remote_path=remote_path,
-                local_path=filepath
-            )
+            # Implement retry mechanism for upload
+            max_retries = 5
+            retry_count = 0
+            upload_successful = False
+            
+            while not upload_successful and retry_count < max_retries:
+                try:
+                    print(f"Uploading results file, attempt {retry_count + 1}/{max_retries}")
+                    webdav_client.upload_file(
+                        remote_path=remote_path,
+                        local_path=filepath
+                    )
+                    upload_successful = True
+                    print("Upload successful!")
+                except Exception as upload_error:
+                    retry_count += 1
+                    error_message = str(upload_error)
+                    print(f"Upload attempt {retry_count} failed: {error_message}")
+                    
+                    if retry_count < max_retries:
+                        # Exponential backoff: wait longer with each retry
+                        wait_time = 1 * (2 ** (retry_count - 1))  # 1, 2, 4, 8, 16 seconds
+                        print(f"Waiting {wait_time} seconds before retrying...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"Maximum retry attempts ({max_retries}) reached. Upload failed.")
+                        # Keep the local file as backup if upload ultimately fails
+                        backup_path = filepath.replace(".json", f"_backup_{int(time.time())}.json")
+                        try:
+                            import shutil
+                            shutil.copy(filepath, backup_path)
+                            print(f"Backup file saved to {backup_path}")
+                        except Exception as backup_error:
+                            print(f"Failed to create backup file: {str(backup_error)}")
 
-            os.remove(filepath)
+            # Only remove the file if upload was successful
+            if upload_successful:
+                os.remove(filepath)
+            
         except Exception as e:
-            print(f"Error saving/uploading results: {str(e)}")
+            print(f"Error in save_and_send: {str(e)}")
 
 def load_tasks():
     if cache["tasks"]["test"] is None or cache["tasks"]["main"] is None:
