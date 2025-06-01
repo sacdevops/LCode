@@ -50,18 +50,16 @@
                 this.remainingTime = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
                 
                 if (this.remainingTime <= 0) {
-                    this.stop();
-                    
-                    const chatInput = document.getElementById("chatInput");
-                    chatInput.setAttribute("contenteditable", "false");
-                    chatInput.style.opacity = "0.5";
-                    chatInput.style.cursor = "not-allowed";
-                    
                     const data = await leftConsole.sendInput("/command", "timeout");
                     if (data.lines_left) leftConsole.update(data.lines_left);
                     if (data.lines_right !== undefined) rightConsole.update(data.lines_right);
+                    
+                    updateInputStates();
+                    
                     if (data.timer_duration > 0) {
                         this.start(data.timer_duration, true);
+                    } else {
+                        this.stop();
                     }
                     return;
                 }
@@ -165,7 +163,6 @@
     const rightConsole = new Console("console-right", "chatInput");
     const timer = new Timer();
     let waitingPhaseChecker = null;
-    let chatReadyChecker = null;
     let llmProcessing = false;
 
     const handleInput = async (console, endpoint) => {
@@ -173,16 +170,8 @@
         if (!text) return;
         
         if (console === rightConsole && endpoint === "/chat") {
-            const statusResponse = await fetch("/status");
-            const statusData = await statusResponse.json();
-            if (!statusData.chat_ready) {
-                console.appendLine("$ Chat is not ready. Please wait...");
-                console.input.innerText = "";
-                return;
-            }
-            
             llmProcessing = true;
-            updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, false);
+            updateInputStates();
         }
         
         console.input.innerText = "";
@@ -199,9 +188,6 @@
             
             if (console === rightConsole && endpoint === "/chat") {
                 llmProcessing = false;
-                const statusResponse = await fetch("/status");
-                const statusData = await statusResponse.json();
-                updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, statusData.chat_ready);
             }
             
             if (data.phase === "summary") {
@@ -212,7 +198,7 @@
                 }
             }
             
-            updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
+            updateInputStates();
             
             if (data.waiting_phase) {
                 setupWaitingPhaseChecker();
@@ -221,20 +207,13 @@
                 waitingPhaseChecker = null;
             }
             
-            if (data.new_question || (!data.chat_ready && data.phase === "questions" && !data.certainty_pending)) {
-                setupChatReadyChecker();
-            }
-            
             console.input.focus();
         } catch(err) {
             window.console.error(err);
-            console.appendLine("$ Error: Could not process your request.");
             if (console === rightConsole) {
                 llmProcessing = false;
-                const statusResponse = await fetch("/status");
-                const statusData = await statusResponse.json();
-                updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, statusData.chat_ready);
             }
+            updateInputStates();
         }
     };
 
@@ -254,14 +233,10 @@
                     if (commandData.lines_left) leftConsole.update(commandData.lines_left);
                     if (commandData.lines_right !== undefined) rightConsole.update(commandData.lines_right);
                     
-                    updateInputStates(false, commandData.certainty_pending, commandData.phase, commandData.chat_ready);
+                    updateInputStates();
                     
                     if (commandData.timer_duration > 0) {
                         timer.start(commandData.timer_duration, true);
-                    }
-                    
-                    if (!commandData.chat_ready && commandData.phase === "questions" && !commandData.certainty_pending) {
-                        setupChatReadyChecker();
                     }
                     
                     clearTimeout(waitingPhaseChecker);
@@ -273,56 +248,37 @@
         }, 1000);
     }
 
-    function setupChatReadyChecker() {
-        if (chatReadyChecker) clearInterval(chatReadyChecker);
-        
-        let updateCount = 0;
-        
-        chatReadyChecker = setInterval(async () => {
-            try {
-                const response = await fetch("/status");
-                const data = await response.json();
-                
-                updateCount++;
-                
-                const currentLinesCount = rightConsole.console.querySelectorAll('.console-line').length;
-                const shouldUpdateConsole = updateCount <= 3 || 
-                                          (data.lines_right && data.lines_right.length !== currentLinesCount);
-                
-                if (shouldUpdateConsole && data.lines_right !== undefined) {
-                    rightConsole.update(data.lines_right);
-                }
-                
-                updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
-                
-                if (data.chat_ready && !data.chat_initializing) {
-                    clearInterval(chatReadyChecker);
-                    chatReadyChecker = null;
-                }
-            } catch (error) {
-                window.console.error("Error checking chat ready status:", error);
+    async function updateInputStates() {
+        try {
+            const response = await fetch("/status");
+            const data = await response.json();
+            
+            const chatInput = document.getElementById("chatInput");
+            const taskInput = document.getElementById("taskInput");
+            
+            const chatEnabled = !llmProcessing && 
+                               data.phase === "questions" && 
+                               !data.waiting_phase &&
+                               !data.certainty_pending;
+            
+            chatInput.setAttribute("contenteditable", chatEnabled ? "true" : "false");
+            chatInput.style.opacity = chatEnabled ? "1" : "0.5";
+            chatInput.style.cursor = chatEnabled ? "text" : "not-allowed";
+            
+            if (!chatEnabled && chatInput.innerText.trim()) {
+                chatInput.innerText = "";
             }
-        }, 750);
-    }
-
-    function updateInputStates(waitingPhase, certaintyPending, currentPhase, chatReady = false) {
-        const chatInput = document.getElementById("chatInput");
-        const taskInput = document.getElementById("taskInput");
-        
-        const chatEnabled = chatReady && !llmProcessing && !waitingPhase && !certaintyPending && currentPhase !== "summary";
-        
-        chatInput.setAttribute("contenteditable", chatEnabled ? "true" : "false");
-        chatInput.style.opacity = chatEnabled ? "1" : "0.5";
-        chatInput.style.cursor = chatEnabled ? "text" : "not-allowed";
-        
-        if (!chatEnabled && chatInput.innerText.trim()) {
-            chatInput.innerText = "";
+            
+            const taskEnabled = (data.phase === "questions" || data.phase === "prolific") && 
+                               !data.waiting_phase;
+            
+            taskInput.setAttribute("contenteditable", taskEnabled ? "true" : "false");
+            taskInput.style.opacity = taskEnabled ? "1" : "0.5";
+            taskInput.style.cursor = taskEnabled ? "text" : "not-allowed";
+            
+        } catch (error) {
+            console.error("Error updating input states:", error);
         }
-        
-        const taskEnabled = !waitingPhase && currentPhase !== "summary";
-        taskInput.setAttribute("contenteditable", taskEnabled ? "true" : "false");
-        taskInput.style.opacity = taskEnabled ? "1" : "0.5";
-        taskInput.style.cursor = taskEnabled ? "text" : "not-allowed";
     }
 
     const setupConsole = (console, endpoint) => {
@@ -364,14 +320,10 @@
             timer.stop();
         }
         
-        updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
+        updateInputStates();
         
         if (data.waiting_phase) {
             setupWaitingPhaseChecker();
-        }
-        
-        if (data.chat_initializing || (data.phase === "questions" && !data.chat_ready && !data.certainty_pending)) {
-            setupChatReadyChecker();
         }
         
         if (data.lines_right !== undefined) {

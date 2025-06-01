@@ -11,7 +11,6 @@ from google.genai import types
 from dotenv import load_dotenv
 from webdav3.client import Client
 import config
-import threading
 
 load_dotenv()
 
@@ -27,8 +26,7 @@ app.secret_key = secrets.token_hex(16)
 app.config["SESSION_PERMANENT"] = False
 
 task_cache = {"test": None, "main": None}
-current_chat = None
-chat_initializing = False
+current_chat_session = None
 
 webdav_options = {
     'webdav_hostname': os.getenv('SCIEBO_URL'),
@@ -105,9 +103,10 @@ def init_session():
         "current_phase": "test",
         "waiting_start_time": None,
         "record_data": {"records": [], "current_task": None},
-        "chat_ready": False,
         "session_id": secrets.token_hex(16),
-        "current_options": []
+        "current_options": [],
+        "current_task_key": None,
+        "is_first_message": False
     }
     
     for key, value in defaults.items():
@@ -143,62 +142,15 @@ def is_phase_complete():
     idx = session["test_idx"] if phase == "test" else session["main_idx"]
     return idx >= len(tasks[phase])
 
-def create_chat_session(task):
-    global current_chat, chat_initializing
-    
-    session["chat_ready"] = False
-    chat_initializing = True
-    treatment_group = session["treatment_group"]
-    
-    def initialize_chat():
-        global current_chat, chat_initializing
-        try:
-            chat_session = genai_client.chats.create(
-                model=LLM_MODEL,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=1500,
-                    temperature=0,
-                )
-            )
-            
-            contents = []
-            prompt = config.TREATMENT_GROUP_PROMPT if treatment_group else config.CONTROL_GROUP_PROMPT
-            contents.append(prompt)
-            
-            if task.get('image_path'):
-                img_path = os.path.join("static", "img", task['image_path'] + ".jpg")
-                if os.path.exists(img_path):
-                    try:
-                        uploaded_file = genai_client.files.upload(
-                            file=img_path,
-                            config=types.UploadFileConfig(mime_type="image/jpeg")
-                        )
-                        contents.append(uploaded_file)
-                    except Exception:
-                        pass
-            
-            contents.append(f"Current math question: {task['question']}")
-            contents.append("You are now ready to help with this math problem. Wait for the user to ask questions.")
-            
-            response = chat_session.send_message(contents)
-            current_chat = chat_session
-            chat_initializing = False
-            
-        except Exception as e:
-            print(f"Error creating chat session: {e}")
-            current_chat = None
-            chat_initializing = False
-    
-    thread = threading.Thread(target=initialize_chat)
-    thread.daemon = True
-    thread.start()
-    
-    return True
-
 def show_question():
+    global current_chat_session
+    
     clear_console()
     session["start_time"] = time.time()
-    session["chat_ready"] = False
+    
+    session["lines_right"] = []
+    current_chat_session = None
+    session["is_first_message"] = False
     
     if is_phase_complete():
         handle_phase_completion()
@@ -212,6 +164,8 @@ def show_question():
     idx = session["test_idx"] if phase == "test" else session["main_idx"]
     total = config.TEST_TASKS_COUNT if phase == "test" else config.MAIN_TASKS_COUNT
     prefix = "PRACTICE QUESTION" if phase == "test" else "QUESTION"
+    
+    session["current_task_key"] = f"{phase}_{idx}"
     
     append_left(f"$  {prefix} {idx+1}/{total}\n")
     
@@ -231,7 +185,9 @@ def show_question():
         append_left(f"   {chr(ord('a') + x)}) {op}")
     
     append_left("$  Type a letter and press ENTER.")
-    create_chat_session(task)
+    
+    fixed_greeting = "<span class='assistant'>Assistant: Hello! I'm your mathematical assistant. I'm ready to help you with this math problem.</span>"
+    append_right(fixed_greeting)
 
 def handle_phase_completion():
     phase = session["current_phase"]
@@ -471,6 +427,11 @@ def handle_timeout():
         
         session["current_result"] = None
         session["certainty_pending"] = False
+        
+        append_left("$  TIME'S UP! Moving to next question...")
+        
+        session["lines_right"] = []
+        
         advance_question()
         return
         
@@ -529,12 +490,19 @@ def handle_certainty(user_input):
     advance_question()
 
 def advance_question():
+    global current_chat_session
+    
     phase = session["current_phase"]
     
     if phase == "test":
         session["test_idx"] += 1
     else:
         session["main_idx"] += 1
+    
+    session["lines_right"] = []
+    session["current_task_key"] = None
+    current_chat_session = None
+    session["is_first_message"] = False
     
     if is_phase_complete():
         handle_phase_completion()
@@ -578,8 +546,6 @@ def home():
 
 @app.route("/status")
 def status():
-    global current_chat, chat_initializing
-    
     timer_duration = 0
     if session["phase"] == "questions":
         if not session["certainty_pending"]:
@@ -591,16 +557,6 @@ def status():
         remaining = max(0, config.WAITING_TIME_SECONDS - elapsed)
         timer_duration = remaining / 60
     
-    if current_chat is not None and not session.get("chat_ready", False):
-        session["chat_ready"] = True
-        if "lines_right" not in session:
-            session["lines_right"] = []
-        fixed_greeting = "<span class='assistant'>Assistant: Hello! I'm your mathematical assistant. I'm ready to help you with this math problem.</span>"
-        if not any("Hello! I'm your mathematical assistant" in line for line in session["lines_right"]):
-            session["lines_right"].append(fixed_greeting)
-    elif current_chat is None:
-        session["chat_ready"] = False
-    
     return jsonify({
         "timer_duration": timer_duration,
         "should_reset": True,
@@ -608,8 +564,6 @@ def status():
         "certainty_pending": session.get("certainty_pending", False),
         "phase": session["phase"],
         "waiting_phase": session["phase"] == "waiting",
-        "chat_ready": session.get("chat_ready", False),
-        "chat_initializing": chat_initializing,
         "lines_right": session.get("lines_right", [])
     })
 
@@ -644,7 +598,7 @@ def command():
             
             if not current_certainty_pending:
                 timer_duration = config.QUESTION_TIME_SECONDS / 60
-                should_reset = was_certainty_pending or user_input == "timeout"
+                should_reset = was_certainty_pending or user_input == "timeout" or new_question
             else:
                 timer_duration = config.CERTAINTY_TIME_SECONDS / 60
                 should_reset = (not was_certainty_pending) or user_input == "timeout"
@@ -662,25 +616,21 @@ def command():
             "certainty_pending": session.get("certainty_pending", False),
             "new_question": new_question,
             "waiting_phase": session["phase"] == "waiting",
-            "phase": session["phase"],
-            "chat_ready": session.get("chat_ready", False)
+            "phase": session["phase"]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    global current_chat
+    global current_chat_session
     
     try:
         if (session["phase"] != "questions" or 
-            session.get("certainty_pending", False) or 
-            not session.get("chat_ready", False) or
-            current_chat is None):
+            session["phase"] == "waiting"):
             return jsonify({
                 "lines_right": session.get("lines_right", []), 
-                "error": "Chat not available",
-                "chat_ready": session.get("chat_ready", False)
+                "error": "Chat not available"
             })
         
         message = request.json.get("message", "").strip()
@@ -690,9 +640,51 @@ def chat():
         user_message_formatted = f"<span class='user'>You: {message}</span>"
         append_right(user_message_formatted)
         
-        response = current_chat.send_message(message)
-        assistant_response = response.text
+        task_key = session.get("current_task_key")
+        if not task_key:
+            return jsonify({"error": "No active task", "lines_right": session.get("lines_right", [])})
         
+        is_first_message = not session.get("is_first_message", False)
+        
+        if is_first_message or current_chat_session is None:
+            current_chat_session = genai_client.chats.create(
+                model=LLM_MODEL,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1000,
+                    temperature=0,
+                )
+            )
+            
+            contents = []
+            treatment_group = session["treatment_group"]
+            prompt = config.TREATMENT_GROUP_PROMPT if treatment_group else config.CONTROL_GROUP_PROMPT
+            contents.append(prompt)
+            
+            task = get_current_task()
+            if task and task.get('image_path'):
+                img_path = os.path.join("static", "img", task['image_path'] + ".jpg")
+                if os.path.exists(img_path):
+                    try:
+                        uploaded_file = genai_client.files.upload(
+                            file=img_path,
+                            config=types.UploadFileConfig(mime_type="image/jpeg")
+                        )
+                        contents.append(uploaded_file)
+                    except Exception as e:
+                        print(f"Error uploading image {img_path}: {e}")
+                else:
+                    print(f"Image file not found: {img_path}")
+            
+            contents.append(f"Current math question: {task['question']}")
+            contents.append(message)
+            
+            response = current_chat_session.send_message(contents)
+            
+            session["is_first_message"] = True
+        else:
+            response = current_chat_session.send_message(message)
+        
+        assistant_response = response.text
         assistant_message_formatted = f"<span class='assistant'>Assistant: {assistant_response}</span>"
         append_right(assistant_message_formatted)
         
@@ -700,11 +692,11 @@ def chat():
         
         return jsonify({
             "lines_right": session.get("lines_right", []),
-            "latest_response": assistant_message_formatted,
-            "chat_ready": True
+            "latest_response": assistant_message_formatted
         })
     except Exception as e:
-        return jsonify({"error": str(e), "chat_ready": False}), 500
+        print(f"Chat error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=os.getenv("PORT", default=5000))
