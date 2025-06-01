@@ -4,34 +4,31 @@ import os
 import time
 import secrets
 import random
-import openai
 import json
-import base64
+import shutil
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from webdav3.client import Client
-from config import NUM_ANSWERS, CERTAINTY_TIME_SECONDS, QUESTION_TIME_SECONDS, TEST_TASKS_COUNT, MAIN_TASKS_COUNT, WAITING_TIME_SECONDS
+import config
+import threading
 
 load_dotenv()
 
-api_key = os.getenv('OPENAI_API_KEY')
+api_key = os.getenv('GEMINI_API_KEY')
 if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
-    
-LLM_MODEL = os.getenv('LLM_ENGINE', 'gpt-4.1-mini')
+    raise ValueError("GEMINI_API_KEY environment variable is not set")
 
-openai_client = openai.OpenAI(api_key=api_key)
+LLM_MODEL = os.getenv('LLM_ENGINE', 'gemini-2.0-flash')
+genai_client = genai.Client(api_key=api_key)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 app.config["SESSION_PERMANENT"] = False
 
-cache = {
-    "images": {},
-    "tasks": {
-        "test": None,
-        "main": None
-    }
-}
+task_cache = {"test": None, "main": None}
+current_chat = None
+chat_initializing = False
 
 webdav_options = {
     'webdav_hostname': os.getenv('SCIEBO_URL'),
@@ -40,116 +37,11 @@ webdav_options = {
     'connect_timeout': 10,
     'read_timeout': 30
 }
+
 webdav_client = Client(webdav_options)
 
-class RecordKeeper:
-    def __init__(self, session):
-        self.session = session
-        
-    def start_task_record(self, task_idx, task, options, task_type):
-        self.session["record_data"]["current_task"] = {
-            "task_index": task_idx,
-            "question": task["question"],
-            "options": options,
-            "solution": task["correct_solution"],
-            "user_inputs": [],
-            "chat_history": [],
-            "time_spent": 0,
-            "final_answer": None,
-            "certainty": None,
-            "task_type": task_type
-        }
-        
-    def add_user_input(self, input_text):
-        if self.session["record_data"]["current_task"]:
-            self.session["record_data"]["current_task"]["user_inputs"].append({
-                "timestamp": time.time(),
-                "input": input_text
-            })
-            
-    def add_chat_interaction(self, user_msg, assistant_msg):
-        if self.session["record_data"]["current_task"]:
-            self.session["record_data"]["current_task"]["chat_history"].append({
-                "timestamp": time.time(),
-                "user": user_msg,
-                "assistant": assistant_msg
-            })
-            
-    def complete_task(self, answer, certainty, time_spent):
-        if self.session["record_data"]["current_task"]:
-            current = self.session["record_data"]["current_task"]
-            current.update({
-                "final_answer": answer,
-                "certainty": certainty,
-                "time_spent": time_spent
-            })
-            self.session["record_data"]["records"].append(current)
-            self.session["record_data"]["current_task"] = None
-            
-    def save_and_send(self, stats):
-        final_data = {
-            "prolific_id": self.session["prolific_id"],
-            "group": "intervention" if self.session["intervention_group"] else "control",
-            "test_tasks": [r for r in self.session["record_data"]["records"] if r["task_type"] == "test"],
-            "main_tasks": [r for r in self.session["record_data"]["records"] if r["task_type"] == "main"],
-            "statistics": stats
-        }
-        
-        try:
-            filename = f'results_{self.session["prolific_id"]}.json'
-            filepath = os.path.join("results", filename)
-            
-            os.makedirs("results", exist_ok=True)
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(final_data, ensure_ascii=False, fp=f)
-
-            remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
-            
-            # Implement retry mechanism for upload
-            max_retries = 5
-            retry_count = 0
-            upload_successful = False
-            
-            while not upload_successful and retry_count < max_retries:
-                try:
-                    print(f"Uploading results file, attempt {retry_count + 1}/{max_retries}")
-                    webdav_client.upload_file(
-                        remote_path=remote_path,
-                        local_path=filepath
-                    )
-                    upload_successful = True
-                    print("Upload successful!")
-                except Exception as upload_error:
-                    retry_count += 1
-                    error_message = str(upload_error)
-                    print(f"Upload attempt {retry_count} failed: {error_message}")
-                    
-                    if retry_count < max_retries:
-                        # Exponential backoff: wait longer with each retry
-                        wait_time = 1 * (2 ** (retry_count - 1))  # 1, 2, 4, 8, 16 seconds
-                        print(f"Waiting {wait_time} seconds before retrying...")
-                        time.sleep(wait_time)
-                    else:
-                        print(f"Maximum retry attempts ({max_retries}) reached. Upload failed.")
-                        # Keep the local file as backup if upload ultimately fails
-                        backup_path = filepath.replace(".json", f"_backup_{int(time.time())}.json")
-                        try:
-                            import shutil
-                            shutil.copy(filepath, backup_path)
-                            print(f"Backup file saved to {backup_path}")
-                        except Exception as backup_error:
-                            print(f"Failed to create backup file: {str(backup_error)}")
-
-            # Only remove the file if upload was successful
-            if upload_successful:
-                os.remove(filepath)
-            
-        except Exception as e:
-            print(f"Error in save_and_send: {str(e)}")
-
 def load_tasks():
-    if cache["tasks"]["test"] is None or cache["tasks"]["main"] is None:
+    if task_cache["test"] is None or task_cache["main"] is None:
         test_tasks = []
         main_tasks = []
         
@@ -175,22 +67,16 @@ def load_tasks():
                         
             random.shuffle(test_tasks)
             random.shuffle(main_tasks)
-            
-            test_tasks = test_tasks[:TEST_TASKS_COUNT]
-            main_tasks = main_tasks[:MAIN_TASKS_COUNT]
-            
-            cache["tasks"]["test"] = test_tasks
-            cache["tasks"]["main"] = main_tasks
-            
+
+            task_cache["test"] = test_tasks[:config.TEST_TASKS_COUNT]
+            task_cache["main"] = main_tasks[:config.MAIN_TASKS_COUNT]
+
         except Exception as e:
             print(f"Error loading tasks: {e}")
-            cache["tasks"]["test"] = []
-            cache["tasks"]["main"] = []
+            task_cache["test"] = []
+            task_cache["main"] = []
             
-    return {
-        "test": cache["tasks"]["test"],
-        "main": cache["tasks"]["main"]
-    }
+    return task_cache
 
 def prepare_options(task):
     options = task['options'].copy()
@@ -198,220 +84,316 @@ def prepare_options(task):
     if correct in options:
         options.remove(correct)
     random.shuffle(options)
-    selected = options[:NUM_ANSWERS-1]
+    selected = options[:config.NUM_ANSWERS-1]
     final = selected + [correct]
     random.shuffle(final)
     return final
 
-def cache_image(task_idx, image_path):
-    if not image_path:
-        return None
-        
-    cache_key = "current_task_image"
+def init_session():
+    defaults = {
+        "phase": "prolific",
+        "lines_left": [],
+        "lines_right": [],
+        "test_idx": 0,
+        "main_idx": 0,
+        "results": [],
+        "start_time": None,
+        "prolific_id": None,
+        "certainty_pending": False,
+        "current_result": None,
+        "treatment_group": config.TREATMENT_GROUP,
+        "current_phase": "test",
+        "waiting_start_time": None,
+        "record_data": {"records": [], "current_task": None},
+        "chat_ready": False,
+        "session_id": secrets.token_hex(16),
+        "current_options": []
+    }
     
-    img_path = os.path.join("static", "img", image_path + ".jpg")
-    if os.path.exists(img_path):
-        try:
-            with open(img_path, "rb") as img_file:
-                image_data = img_file.read()
-                base64_image = base64.b64encode(image_data).decode('utf-8')
-                cache["images"] = {cache_key: base64_image}
-                return cache_key
-        except Exception as e:
-            print(f"Error caching image: {str(e)}")
+    for key, value in defaults.items():
+        if key not in session:
+            session[key] = value
+
+def clear_console():
+    session["lines_left"] = []
+    session["lines_right"] = []
+
+def append_left(txt):
+    if "lines_left" not in session:
+        session["lines_left"] = []
+    session["lines_left"].append(txt)
+
+def append_right(txt):
+    if "lines_right" not in session:
+        session["lines_right"] = []
+    session["lines_right"].append(txt)
+
+def get_current_task():
+    tasks = load_tasks()
+    phase = session["current_phase"]
+    idx = session["test_idx"] if phase == "test" else session["main_idx"]
     
+    if idx < len(tasks[phase]):
+        return tasks[phase][idx]
     return None
 
-def get_cached_image(cache_key):
-    return cache["images"].get(cache_key)
+def is_phase_complete():
+    tasks = load_tasks()
+    phase = session["current_phase"]
+    idx = session["test_idx"] if phase == "test" else session["main_idx"]
+    return idx >= len(tasks[phase])
 
-class SessionManager:
-    def __init__(self, session):
-        self.session = session
-        self.record_keeper = RecordKeeper(session)
+def create_chat_session(task):
+    global current_chat, chat_initializing
     
-    def init_state(self):
-        defaults = {
-            "phase": "prolific",
-            "lines_left": [],
-            "lines_right": [],
-            "test_idx": 0,
-            "main_idx": 0,
-            "results": [],
-            "start_time": None,
-            "prolific_id": None,
-            "certainty_pending": False,
-            "current_result": None,
-            "intervention_group": random.choice([True, False]),
-            "current_image_key": None,
-            "current_phase": "test",
-            "waiting_start_time": None
-        }
-        for key, value in defaults.items():
-            if key not in self.session:
-                self.session[key] = value
-        
-        if "record_data" not in self.session:
-            self.session["record_data"] = {
-                "records": [],
-                "current_task": None
-            }
+    session["chat_ready"] = False
+    chat_initializing = True
+    treatment_group = session["treatment_group"]
+    
+    def initialize_chat():
+        global current_chat, chat_initializing
+        try:
+            chat_session = genai_client.chats.create(
+                model=LLM_MODEL,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1500,
+                    temperature=0,
+                )
+            )
+            
+            contents = []
+            prompt = config.TREATMENT_GROUP_PROMPT if treatment_group else config.CONTROL_GROUP_PROMPT
+            contents.append(prompt)
+            
+            if task.get('image_path'):
+                img_path = os.path.join("static", "img", task['image_path'] + ".jpg")
+                if os.path.exists(img_path):
+                    try:
+                        uploaded_file = genai_client.files.upload(
+                            file=img_path,
+                            config=types.UploadFileConfig(mime_type="image/jpeg")
+                        )
+                        contents.append(uploaded_file)
+                    except Exception:
+                        pass
+            
+            contents.append(f"Current math question: {task['question']}")
+            contents.append("You are now ready to help with this math problem. Wait for the user to ask questions.")
+            
+            response = chat_session.send_message(contents)
+            current_chat = chat_session
+            chat_initializing = False
+            
+        except Exception as e:
+            print(f"Error creating chat session: {e}")
+            current_chat = None
+            chat_initializing = False
+    
+    thread = threading.Thread(target=initialize_chat)
+    thread.daemon = True
+    thread.start()
+    
+    return True
 
-    def clear_console(self):
-        self.session["lines_left"] = []
-        self.session["lines_right"] = []
+def show_question():
+    clear_console()
+    session["start_time"] = time.time()
+    session["chat_ready"] = False
     
-    def append_left(self, txt):
-        lines = self.session["lines_left"]
-        lines.append(txt)
+    if is_phase_complete():
+        handle_phase_completion()
+        return
     
-    def append_right(self, txt):
-        lines = self.session["lines_right"]
-        lines.append(txt)
+    task = get_current_task()
+    if not task:
+        return
+        
+    phase = session["current_phase"]
+    idx = session["test_idx"] if phase == "test" else session["main_idx"]
+    total = config.TEST_TASKS_COUNT if phase == "test" else config.MAIN_TASKS_COUNT
+    prefix = "PRACTICE QUESTION" if phase == "test" else "QUESTION"
     
-    def reset(self):
-        self.session.clear()
-        self.init_state()
+    append_left(f"$  {prefix} {idx+1}/{total}\n")
+    
+    if task.get("image_path"):
+        img_path = os.path.join("static", "img", task["image_path"] + ".jpg")
+        if os.path.exists(img_path):
+            append_left(f'<img src="static/img/{task["image_path"]}.jpg" class="task-img">')
+    
+    append_left(f"   {task['question']}")
+    
+    options = prepare_options(task)
+    session['current_options'] = options
+    
+    start_task_record(idx, task, options, phase)
+    
+    for x, op in enumerate(options):
+        append_left(f"   {chr(ord('a') + x)}) {op}")
+    
+    append_left("$  Type a letter and press ENTER.")
+    create_chat_session(task)
 
-class QuestionManager:
-    def __init__(self, session_manager):
-        self.sm = session_manager
+def handle_phase_completion():
+    phase = session["current_phase"]
     
-    def show_question(self):
-        phase = self.sm.session["current_phase"]
-        if phase == "test":
-            i = self.sm.session["test_idx"]
-            tlist = load_tasks()["test"]
-            total_count = TEST_TASKS_COUNT
-            prefix = "PRACTICE QUESTION"
-        else:
-            i = self.sm.session["main_idx"]
-            tlist = load_tasks()["main"]
-            total_count = MAIN_TASKS_COUNT
-            prefix = "QUESTION"
+    if phase == "test":
+        session["phase"] = "waiting"
+        session["waiting_start_time"] = time.time()
+        clear_console()
         
-        if i >= len(tlist):
-            if phase == "test":
-                self.sm.session["phase"] = "waiting"
-                self.sm.session["waiting_start_time"] = time.time()
-                self.sm.clear_console()
-                
-                self.sm.append_left("$  Practice Phase Completed!")
-                self.sm.append_left("$")
-                self.sm.append_left("$  You have completed the practice questions.")
-                self.sm.append_left("$  The main study will begin shortly.")
-                self.sm.append_left("$")
-                self.sm.append_left(f"$  Please wait {WAITING_TIME_SECONDS} seconds...")
-                
-                return
-            else:
-                self.sm.session["phase"] = "summary"
-                self.sm.clear_console()
-                return self.show_summary()
-        
-        self.sm.session["start_time"] = time.time()
-        t = tlist[i]
-        
-        self.sm.append_left(f"$  {prefix} {i+1}/{total_count}\n")
-        
-        self.sm.session["current_image_key"] = None
-        if t["image_path"]:
-            img_path = os.path.join("static", "img", t["image_path"] + ".jpg")
-            if os.path.exists(img_path):
-                self.sm.append_left(f"""<img src="static/img/{t['image_path']}.jpg" class="task-img">""")
-                
-                self.sm.session["current_image_key"] = cache_image(i, t["image_path"])
-        
-        self.sm.append_left(f"   {t['question']}")
-        
-        options = prepare_options(t)
-        self.sm.session['current_options'] = options
-        
-        if "record_data" not in self.sm.session:
-            self.sm.session["record_data"] = {
-                "records": [],
-                "current_task": None
-            }
-        self.sm.record_keeper.start_task_record(i, t, options, phase)
-        
-        for x, op in enumerate(options):
-            self.sm.append_left(f"   {chr(ord('a') + x)}) {op}")
-        
-        self.sm.append_left("$  Type a letter and press ENTER.")
+        append_left("$  Practice Phase Completed!")
+        append_left("$")
+        append_left("$  You have completed the practice questions.")
+        append_left("$  The main study will begin shortly.")
+        append_left("$")
+        append_left(f"$  Please wait {config.WAITING_TIME_SECONDS} seconds...")
+    else:
+        session["phase"] = "summary"
+        clear_console()
+        show_summary()
+
+def show_waiting_phase():
+    elapsed = time.time() - session["waiting_start_time"]
+    remaining = max(0, config.WAITING_TIME_SECONDS - elapsed)
     
-    def show_waiting_phase(self):
-        elapsed = time.time() - self.sm.session["waiting_start_time"]
-        remaining = max(0, WAITING_TIME_SECONDS - elapsed)
-        
-        if remaining <= 0:
-            self.sm.session["phase"] = "questions"
-            self.sm.session["current_phase"] = "main"
-            self.sm.clear_console()
-            self.show_question()
+    if remaining <= 0:
+        session["phase"] = "questions"
+        session["current_phase"] = "main"
+        clear_console()
+        show_question()
+
+def show_summary():
+    main_results = [r for r in session["results"] if r.get("task_type", "main") == "main"]
+    stats = calculate_stats(main_results)
+    save_results(stats)
     
-    def show_summary(self):
-        main_results = [r for r in self.sm.session["results"] if r.get("task_type", "main") == "main"]
-        stats = self.calculate_stats(main_results)
-        self.sm.record_keeper.save_and_send(stats)
-        
-        self.sm.append_left("$  Thank you for participating in our study!")
-        self.sm.append_left("$")
-        self.sm.append_left("$  Below are your results from the math problem-solving session:")
-        self.sm.append_left("$")
-        
-        self.sm.append_left(self.generate_summary_table(main_results, stats))
-        self.sm.append_left(self.generate_summary_footer(stats))
-        
-        self.sm.append_left("$")
-        self.sm.append_left("$  Your participation is greatly appreciated. You may now close this tab.")
-        self.sm.append_left("$  Please return to LimeSurvey to complete the study.")
+    append_left("$  Thank you for participating in our study!")
+    append_left("$")
+    append_left("$  Below are your results from the math problem-solving session:")
+    append_left("$")
     
-    def calculate_stats(self, results):
-        return {
-            "time_sum": sum(x["time_spent"] for x in results),
-            "correct": sum(1 for x in results if x["is_correct"]),
-            "total": len(results),
-            "avg_certainty": sum(x["certainty"] for x in results)/len(results) if results else 0,
-            "avg_time": sum(x["time_spent"] for x in results)/len(results) if results else 0,
-        }
+    append_left(generate_summary_table(main_results))
+    append_left(generate_summary_footer(stats))
     
-    def generate_summary_table(self, results, stats):
-        lines = []
-        lines.append("""$  ┌────┬───────────────────────────┬───────────────────────────┬───────────┬───────────┐
-   | #  | Chosen                    | Correct                   | Certainty | Time (s)  |
-   ├────┼───────────────────────────┼───────────────────────────┼───────────┼───────────┤""")
+    append_left("$")
+    append_left("$  Your participation is greatly appreciated. You may now close this tab.")
+    append_left("$  Please return to LimeSurvey to complete the study.")
+
+def calculate_stats(results):
+    if not results:
+        return {"time_sum": 0, "correct": 0, "total": 0, "avg_certainty": 0, "avg_time": 0}
         
-        for i, itm in enumerate(results, start=1):
-            lines.append(f"""   | {i:<2} | {itm['chosen_option']:<25} | {itm['correct_option']:<25} | {itm['certainty']:<9} | {itm['time_spent']:9.2f} |""")
-        
-        return "\n".join(lines)
+    return {
+        "time_sum": sum(x["time_spent"] for x in results),
+        "correct": sum(1 for x in results if x["is_correct"]),
+        "total": len(results),
+        "avg_certainty": sum(x["certainty"] for x in results)/len(results),
+        "avg_time": sum(x["time_spent"] for x in results)/len(results),
+    }
+
+def generate_summary_table(results):
+    lines = []
+    lines.append("$  ┌────┬───────────────────────────┬───────────────────────────┬───────────┬───────────┐")
+    lines.append("   | #  | Chosen                    | Correct                   | Certainty | Time (s)  |")
+    lines.append("   ├────┼───────────────────────────┼───────────────────────────┼───────────┼───────────┤")
     
-    def generate_summary_footer(self, stats):
-        return f"""   └────┴───────────────────────────┴───────────────────────────┴───────────┴───────────┘
+    for i, itm in enumerate(results, start=1):
+        lines.append(f"   | {i:<2} | {itm['chosen_option']:<25} | {itm['correct_option']:<25} | {itm['certainty']:<9} | {itm['time_spent']:9.2f} |")
+    
+    return "\n".join(lines)
+
+def generate_summary_footer(stats):
+    return f"""   └────┴───────────────────────────┴───────────────────────────┴───────────┴───────────┘
     Total: {stats['total']}
     Correct: {stats['correct']}
     Wrong: {stats['total'] - stats['correct']}
     Average time: {stats['avg_time']:.2f}s
     Average certainty: {stats['avg_certainty']:.2f}
-    Group: {"intervention" if self.sm.session["intervention_group"] else "control"}"""
+    Group: {"treatment" if session["treatment_group"] else "control"}"""
 
-class InputHandler:
-    def __init__(self, session_manager):
-        self.sm = session_manager
-        self.qm = QuestionManager(session_manager)
+def start_task_record(task_idx, task, options, task_type):
+    session["record_data"]["current_task"] = {
+        "task_index": task_idx,
+        "question": task["question"],
+        "options": options,
+        "solution": task["correct_solution"],
+        "user_inputs": [],
+        "chat_history": [],
+        "time_spent": 0,
+        "final_answer": None,
+        "certainty": None,
+        "task_type": task_type
+    }
+
+def add_chat_interaction(user_msg, assistant_msg):
+    if session["record_data"]["current_task"]:
+        session["record_data"]["current_task"]["chat_history"].append({
+            "timestamp": time.time(),
+            "user": user_msg,
+            "assistant": assistant_msg
+        })
+
+def complete_task(answer, certainty, time_spent):
+    if session["record_data"]["current_task"]:
+        current = session["record_data"]["current_task"]
+        current.update({
+            "final_answer": answer,
+            "certainty": certainty,
+            "time_spent": time_spent
+        })
+        session["record_data"]["records"].append(current)
+        session["record_data"]["current_task"] = None
+
+def save_results(stats):
+    final_data = {
+        "prolific_id": session["prolific_id"],
+        "group": "treatment" if session["treatment_group"] else "control",
+        "test_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "test"],
+        "main_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "main"],
+        "statistics": stats
+    }
     
-    def handle(self, user_input):
-        handlers = {
-            "prolific": self.handle_prolific,
-            "questions": self.handle_questions,
-            "waiting": self.handle_waiting
-        }
-        return handlers.get(self.sm.session["phase"], lambda x: None)(user_input)
+    try:
+        filename = f'results_{session["prolific_id"]}.json'
+        filepath = os.path.join("results", filename)
+        
+        os.makedirs("results", exist_ok=True)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(final_data, f, ensure_ascii=False, indent=2)
+
+        if webdav_client:
+            upload_to_sciebo(filepath, filename)
+        
+    except Exception as e:
+        print(f"Error saving results: {e}")
+
+def upload_to_sciebo(filepath, filename):
+    if not webdav_client:
+        return
+        
+    remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
     
-    def handle_prolific(self, u):
-        if len(u) > 0:
-            self.sm.session.update({
-                "prolific_id": u,
+    for attempt in range(3):
+        try:
+            webdav_client.upload_file(remote_path=remote_path, local_path=filepath)
+            os.remove(filepath)
+            return
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
+    
+    backup_path = filepath.replace(".json", f"_backup_{int(time.time())}.json")
+    try:
+        shutil.copy(filepath, backup_path)
+    except Exception:
+        pass
+
+def handle_input(user_input):
+    if session["phase"] == "prolific":
+        if user_input.strip():
+            session.update({
+                "prolific_id": user_input.strip(),
                 "phase": "questions",
                 "current_phase": "test",
                 "test_idx": 0,
@@ -419,214 +401,205 @@ class InputHandler:
                 "results": [],
                 "certainty_pending": False
             })
-            self.sm.clear_console()
-            self.qm.show_question()
+            show_question()
         else:
-            self.sm.append_left("$  Invalid Prolific ID. Please try again:")
+            append_left("$  Invalid Prolific ID. Please try again:")
     
-    def handle_waiting(self, u):
-        self.qm.show_waiting_phase()
+    elif session["phase"] == "waiting":
+        show_waiting_phase()
+    
+    elif session["phase"] == "questions":
+        if session["certainty_pending"]:
+            handle_certainty(user_input)
+        else:
+            handle_answer(user_input)
+
+def handle_answer(user_input):
+    if user_input == "timeout":
+        handle_timeout()
         return
     
-    def handle_questions(self, u):
-        if self.sm.session["certainty_pending"]:
-            if u == "timeout":
-                self.record_certainty(1)
-                self.advance_question()
-                return
-            return self.handle_certainty(u)
-        
-        if not u:
-            return
-            
-        phase = self.sm.session["current_phase"]
-        if phase == "test":
-            i = self.sm.session["test_idx"]
-            tasks = load_tasks()["test"]
-        else:
-            i = self.sm.session["main_idx"]
-            tasks = load_tasks()["main"]
-            
-        if i >= len(tasks):
-            self.end_questions()
-            return
-            
-        self.process_answer(u)
+    valid_letters = [chr(ord('a') + x) for x in range(config.NUM_ANSWERS)]
+    if not user_input or user_input.lower() not in valid_letters:
+        if user_input:
+            append_left("$  Invalid letter.")
+        return
     
-    def handle_certainty(self, u):
-        if u not in ["1", "2", "3", "4"]:
-            self.sm.append_left("$  Invalid input. Please enter a number between 1-4:")
-            return
-            
-        self.record_certainty(int(u))
-        self.advance_question()
+    task = get_current_task()
+    if not task:
+        return
     
-    def process_answer(self, u):
-        self.sm.record_keeper.add_user_input(u)
-        
-        phase = self.sm.session["current_phase"]
-        if phase == "test":
-            i = self.sm.session["test_idx"]
-            t = load_tasks()["test"][i]
-        else:
-            i = self.sm.session["main_idx"]
-            t = load_tasks()["main"][i]
-            
-        spent = time.time() - self.sm.session["start_time"] if self.sm.session["start_time"] else 0
-        
-        if u == "timeout" or spent >= QUESTION_TIME_SECONDS:
-            return self.handle_timeout(t, spent)
-            
-        if not self.is_valid_answer(u):
-            return
-            
-        self.record_answer(u, t, spent)
-        self.ask_certainty()
+    spent = time.time() - session["start_time"] if session["start_time"] else 0
     
-    def is_valid_answer(self, u):
-        allowed_letters = [chr(ord('a') + x) for x in range(NUM_ANSWERS)]
-        if u not in allowed_letters:
-            self.sm.append_left("$  Invalid letter.")
-            return False
-        return True
-
-    def handle_timeout(self, task, spent):
-        self.sm.append_left("$  TIME'S UP! Moving to next question...")
-        self.sm.session["current_result"] = {
-            "question": task["question"],
-            "chosen_option": "TIMEOUT",
-            "correct_option": task["correct_solution"],
-            "is_correct": False,
-            "time_spent": QUESTION_TIME_SECONDS,
-            "task_type": self.sm.session["current_phase"]
-        }
+    if spent >= config.QUESTION_TIME_SECONDS:
+        handle_timeout()
+        return
+    
+    answer_idx = ord(user_input.lower()) - ord('a')
+    if answer_idx >= len(session.get('current_options', [])):
+        append_left("$  Invalid option.")
+        return
         
-        self.sm.session["certainty_pending"] = True
-        self.ask_certainty()
+    chosen = session['current_options'][answer_idx]
+    correct = (chosen == task["correct_solution"])
 
-    def record_answer(self, u, task, spent):
-        answer_idx = ord(u) - ord('a')
-        chosen = self.sm.session['current_options'][answer_idx]
-        correct = (chosen == task["correct_solution"])
+    session["current_result"] = {
+        "question": task["question"],
+        "chosen_option": chosen,
+        "correct_option": task["correct_solution"],
+        "is_correct": correct,
+        "time_spent": spent,
+        "task_type": session["current_phase"]
+    }
+    
+    ask_certainty()
 
-        self.sm.session["current_result"] = {
-            "question": task["question"],
-            "chosen_option": chosen,
-            "correct_option": task["correct_solution"],
-            "is_correct": correct,
-            "time_spent": spent,
-            "task_type": self.sm.session["current_phase"]
-        }
+def handle_timeout():
+    task = get_current_task()
+    if not task:
+        return
+    
+    if session.get("certainty_pending", False):
+        session["current_result"]["certainty"] = 0
+        session["results"].append(session["current_result"])
         
-    def ask_certainty(self):
-        self.sm.session["certainty_pending"] = True
-        self.sm.append_left("\n$  How certain are you about your decision?")
-        self.sm.append_left("\n$  Type a digit from 1 to 4 and press ENTER:")
-        self.sm.append_left("   1) uncertain")
-        self.sm.append_left("   2) rather uncertain")
-        self.sm.append_left("   3) rather certain")
-        self.sm.append_left("   4) certain")
-
-    def record_certainty(self, certainty):
-        self.sm.session["current_result"]["certainty"] = certainty
-        self.sm.session["results"].append(self.sm.session["current_result"])
-        result = self.sm.session["current_result"]
-
-        self.sm.record_keeper.complete_task(
-            result["chosen_option"],
-            certainty,
-            result["time_spent"]
+        complete_task(
+            session["current_result"]["chosen_option"],
+            0,
+            session["current_result"]["time_spent"]
         )
-        self.sm.session["current_result"] = None
-        self.sm.session["certainty_pending"] = False
-
-    def advance_question(self):
-        phase = self.sm.session["current_phase"]
         
-        if phase == "test":
-            self.sm.session["test_idx"] += 1
-            if self.sm.session["test_idx"] >= len(load_tasks()["test"]):
-                self.sm.session["phase"] = "waiting"
-                self.sm.session["waiting_start_time"] = time.time()
-                
-                self.sm.session["lines_left"] = []
-                self.sm.session["lines_right"] = []
-                
-                self.sm.append_left("$  Practice Phase Completed!")
-                self.sm.append_left("$")
-                self.sm.append_left("$  You have completed the practice questions.")
-                self.sm.append_left("$  The main study will begin shortly.")
-                self.sm.append_left("$")
-                self.sm.append_left(f"$  Please wait {WAITING_TIME_SECONDS} seconds...")
-            else:
-                self.sm.session["lines_left"] = []
-                self.qm.show_question()
-        else:
-            self.sm.session["main_idx"] += 1
-            if self.sm.session["main_idx"] >= len(load_tasks()["main"]):
-                self.sm.session["phase"] = "summary"
-                self.sm.clear_console()
-                self.qm.show_summary()
-            else:
-                self.sm.session["lines_left"] = []
-                self.sm.session["lines_right"] = []
-                self.qm.show_question()
+        session["current_result"] = None
+        session["certainty_pending"] = False
+        advance_question()
+        return
+        
+    session["current_result"] = {
+        "question": task["question"],
+        "chosen_option": "TIMEOUT",
+        "correct_option": task["correct_solution"],
+        "is_correct": False,
+        "time_spent": config.QUESTION_TIME_SECONDS,
+        "task_type": session["current_phase"]
+    }
+    
+    append_left("$  TIME'S UP! Moving to next question...")
+    ask_certainty()
 
-    def end_questions(self):
-        self.sm.session["phase"] = "summary"
-        self.sm.clear_console()
-        self.qm.show_summary()
+def ask_certainty():
+    session["certainty_pending"] = True
+    
+    chosen_option = session['current_result']['chosen_option']
+    current_options = session.get('current_options', [])
+    
+    if chosen_option != "TIMEOUT" and chosen_option in current_options:
+        answer_idx = current_options.index(chosen_option)
+        letter = chr(ord('a') + answer_idx)
+        append_left(f"\n$  You selected {letter}) {chosen_option}")
+    else:
+        append_left(f"\n$  Time expired - no answer selected")
+    
+    append_left("\n$  How certain are you about your decision?")
+    append_left("\n$  Type a digit from 1 to 4 and press ENTER:")
+    append_left("   1) uncertain")
+    append_left("   2) rather uncertain")
+    append_left("   3) rather certain")
+    append_left("   4) certain")
+
+def handle_certainty(user_input):
+    if user_input == "timeout":
+        certainty = 0
+    elif user_input in ["1", "2", "3", "4"]:
+        certainty = int(user_input)
+    else:
+        append_left("$  Invalid input. Please enter a number between 1-4:")
+        return
+    
+    session["current_result"]["certainty"] = certainty
+    session["results"].append(session["current_result"])
+    
+    complete_task(
+        session["current_result"]["chosen_option"],
+        certainty,
+        session["current_result"]["time_spent"]
+    )
+    
+    session["current_result"] = None
+    session["certainty_pending"] = False
+    advance_question()
+
+def advance_question():
+    phase = session["current_phase"]
+    
+    if phase == "test":
+        session["test_idx"] += 1
+    else:
+        session["main_idx"] += 1
+    
+    if is_phase_complete():
+        handle_phase_completion()
+    else:
+        show_question()
 
 @app.before_request
-def before():
+def before_request():
     session.permanent = False
-    SessionManager(session).init_state()
+    init_session()
     load_tasks()
 
 @app.route("/")
 def home():
-    sm = SessionManager(session)
     if session["phase"] == "prolific" and not session["lines_left"]:
-        time_str = ""
-        if QUESTION_TIME_SECONDS < 60:
-            time_str = f"{QUESTION_TIME_SECONDS} seconds"
-        else:
-            minutes = QUESTION_TIME_SECONDS // 60
-            seconds = QUESTION_TIME_SECONDS % 60
+        time_str = f"{config.QUESTION_TIME_SECONDS} seconds"
+        if config.QUESTION_TIME_SECONDS >= 60:
+            minutes = config.QUESTION_TIME_SECONDS // 60
+            seconds = config.QUESTION_TIME_SECONDS % 60
             time_str = f"{minutes} minute{'s' if minutes > 1 else ''}"
             if seconds:
                 time_str += f" and {seconds} second{'s' if seconds > 1 else ''}"
 
-        sm.clear_console()
-        sm.append_left("$  Welcome to the Math Problem Solving Study!")
-        sm.append_left("$")
-        sm.append_left(f"$  In the following, you will be asked to solve overall seven math problems that will appear here on the left panel. You will have {time_str} minutes for each task. The answer mode is single-choice, for each problem, four answer options will be shown. After each answer, you will be asked about your confidence in that answer.  ")
-        sm.append_left("$")
-        sm.append_left("$  You will have access to the <b>mathematical assistant</b>, a chatbot specialized to support your problem-solving. The mathematical assistant will be shown on the right panel. Please use the mathematical assistant to solve all math problems. You may additionally use pen and paper. ")
-        sm.append_left("$")
-        sm.append_left(f"$  The first {TEST_TASKS_COUNT} math problems will be part of a test phase, where you can get used to the tool. After that, you will solve {MAIN_TASKS_COUNT} math problems as part of the study, that is we will measure and analyse your performance. ")
-        sm.append_left("$")
+        clear_console()
+        append_left("$  Welcome to the Math Problem Solving Study!")
+        append_left("$")
+        append_left(f"$  In the following, you will be asked to solve overall seven math problems that will appear here on the left panel. You will have {time_str} for each task. The answer mode is single-choice, for each problem, four answer options will be shown. After each answer, you will be asked about your confidence.")
+        append_left("$")
+        append_left("$  You will have access to the <b>mathematical assistant</b>, a chatbot specialized to support your problem-solving. The mathematical assistant will be shown on the right panel. Please use the mathematical assistant to solve all math problems. You may additionally use pen and paper.")
+        append_left("$")
+        append_left(f"$  The first {config.TEST_TASKS_COUNT} math problems will be part of a test phase, where you can get used to the tool. After that, you will solve {config.MAIN_TASKS_COUNT} math problems as part of the study, that is we will measure and analyse your performance.")
+        append_left("$")
+        append_left("$  After submitting your answer, you'll be asked to rate your confidence.")
+        append_left("$")
+        append_left("$  Please enter your Prolific ID to begin:")
         
-        sm.append_left("$  After submitting your answer, you'll be asked to rate your confidence.")
-        sm.append_left("$")
-        sm.append_left("$  Please enter your Prolific ID to begin:")
     return render_template("console.html", 
-                         lines_left=session["lines_left"], 
-                         lines_right=session["lines_right"],
+                         lines_left=session.get("lines_left", []), 
+                         lines_right=session.get("lines_right", []),
                          session=session)
 
 @app.route("/status")
 def status():
+    global current_chat, chat_initializing
+    
     timer_duration = 0
     if session["phase"] == "questions":
         if not session["certainty_pending"]:
-            timer_duration = QUESTION_TIME_SECONDS / 60
+            timer_duration = config.QUESTION_TIME_SECONDS / 60
         else:
-            timer_duration = CERTAINTY_TIME_SECONDS / 60
+            timer_duration = config.CERTAINTY_TIME_SECONDS / 60
     elif session["phase"] == "waiting":
         elapsed = time.time() - session["waiting_start_time"] if session["waiting_start_time"] else 0
-        remaining = max(0, WAITING_TIME_SECONDS - elapsed)
+        remaining = max(0, config.WAITING_TIME_SECONDS - elapsed)
         timer_duration = remaining / 60
+    
+    if current_chat is not None and not session.get("chat_ready", False):
+        session["chat_ready"] = True
+        if "lines_right" not in session:
+            session["lines_right"] = []
+        fixed_greeting = "<span class='assistant'>Assistant: Hello! I'm your mathematical assistant. I'm ready to help you with this math problem.</span>"
+        if not any("Hello! I'm your mathematical assistant" in line for line in session["lines_right"]):
+            session["lines_right"].append(fixed_greeting)
+    elif current_chat is None:
+        session["chat_ready"] = False
     
     return jsonify({
         "timer_duration": timer_duration,
@@ -634,127 +607,104 @@ def status():
         "question_idx": session["test_idx"] if session["current_phase"] == "test" else session["main_idx"],
         "certainty_pending": session.get("certainty_pending", False),
         "phase": session["phase"],
-        "waiting_phase": session["phase"] == "waiting"
+        "waiting_phase": session["phase"] == "waiting",
+        "chat_ready": session.get("chat_ready", False),
+        "chat_initializing": chat_initializing,
+        "lines_right": session.get("lines_right", [])
     })
 
 @app.route("/command", methods=["POST"])
 def command():
-    data = request.json or {}
-    raw_input = data.get("input", "")
-    user_input = raw_input.get("input", "") if isinstance(raw_input, dict) else raw_input
-    user_input = str(user_input).strip()
-    
-    was_certainty_pending = session.get("certainty_pending", False)
-    
-    previous_test_idx = session.get("test_idx", 0)
-    previous_main_idx = session.get("main_idx", 0)
-    previous_phase = session.get("current_phase", "test")
-    
-    ih = InputHandler(SessionManager(session))
-    ih.handle(user_input)
-    
-    timer_duration = 0
-    should_reset = False
-    
-    current_phase = session.get("current_phase", "test")
-    current_test_idx = session.get("test_idx", 0)
-    current_main_idx = session.get("main_idx", 0)
-    
-    new_question = ((previous_test_idx != current_test_idx and current_phase == "test") or 
-                   (previous_main_idx != current_main_idx and current_phase == "main") or
-                   previous_phase != current_phase) and not session.get("certainty_pending", False)
-    
-    if session["phase"] == "questions":
-        current_certainty_pending = session.get("certainty_pending", False)
+    try:
+        data = request.json or {}
+        raw_input = data.get("input", "")
+        user_input = raw_input.get("input", "") if isinstance(raw_input, dict) else raw_input
+        user_input = str(user_input).strip().lower()
         
-        if not current_certainty_pending:
-            timer_duration = QUESTION_TIME_SECONDS / 60
-            should_reset = was_certainty_pending or user_input == "timeout"
-        else:
-            timer_duration = CERTAINTY_TIME_SECONDS / 60
-            should_reset = (not was_certainty_pending) or user_input == "timeout"
-    elif session["phase"] == "waiting":
-        elapsed = time.time() - session["waiting_start_time"] if session["waiting_start_time"] else 0
-        remaining = max(0, WAITING_TIME_SECONDS - elapsed)
-        timer_duration = remaining / 60
-        should_reset = True
-    
-    return jsonify({
-        "lines_left": session["lines_left"],
-        "lines_right": session["lines_right"],
-        "timer_duration": timer_duration,
-        "should_reset": should_reset,
-        "certainty_pending": session.get("certainty_pending", False),
-        "new_question": new_question,
-        "waiting_phase": session["phase"] == "waiting",
-        "phase": session["phase"]
-    })
+        was_certainty_pending = session.get("certainty_pending", False)
+        previous_test_idx = session.get("test_idx", 0)
+        previous_main_idx = session.get("main_idx", 0)
+        previous_phase = session.get("current_phase", "test")
+        
+        handle_input(user_input)
+        
+        current_phase = session.get("current_phase", "test")
+        current_test_idx = session.get("test_idx", 0)
+        current_main_idx = session.get("main_idx", 0)
+        
+        new_question = ((previous_test_idx != current_test_idx and current_phase == "test") or 
+                       (previous_main_idx != current_main_idx and current_phase == "main") or
+                       previous_phase != current_phase) and not session.get("certainty_pending", False)
+        
+        timer_duration = 0
+        should_reset = False
+        
+        if session["phase"] == "questions":
+            current_certainty_pending = session.get("certainty_pending", False)
+            
+            if not current_certainty_pending:
+                timer_duration = config.QUESTION_TIME_SECONDS / 60
+                should_reset = was_certainty_pending or user_input == "timeout"
+            else:
+                timer_duration = config.CERTAINTY_TIME_SECONDS / 60
+                should_reset = (not was_certainty_pending) or user_input == "timeout"
+        elif session["phase"] == "waiting":
+            elapsed = time.time() - session["waiting_start_time"] if session["waiting_start_time"] else 0
+            remaining = max(0, config.WAITING_TIME_SECONDS - elapsed)
+            timer_duration = remaining / 60
+            should_reset = True
+        
+        return jsonify({
+            "lines_left": session.get("lines_left", []),
+            "lines_right": session.get("lines_right", []),
+            "timer_duration": timer_duration,
+            "should_reset": should_reset,
+            "certainty_pending": session.get("certainty_pending", False),
+            "new_question": new_question,
+            "waiting_phase": session["phase"] == "waiting",
+            "phase": session["phase"],
+            "chat_ready": session.get("chat_ready", False)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    if session["phase"] != "questions" or session.get("certainty_pending", False):
-        return jsonify({"lines_right": session["lines_right"]})
-    
-    message = request.json.get("message", "").strip()
-    
-    if session["current_phase"] == "test":
-        current_question_idx = session["test_idx"]
-        task_list = load_tasks()["test"]
-    else:
-        current_question_idx = session["main_idx"]
-        task_list = load_tasks()["main"]
-    
-    if not message or current_question_idx >= len(task_list):
-        return jsonify({"lines_right": session["lines_right"]})
-    
-    sm = SessionManager(session)
-    current_task = task_list[current_question_idx]
-    
-    content = [
-        {"type": "text", "text": f"Current math question: {current_task['question']}\n\nUser question: {message}"}
-    ]
-    
-    image_key = session.get("current_image_key")
-    if image_key:
-        base64_image = get_cached_image(image_key)
-        if base64_image:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{base64_image}"
-                }
-            })
+    global current_chat
     
     try:
-        response = openai_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a math assistant that helps with the current math problem. For math-related questions, help guide the user toward solving the problem without directly giving the answer."},
-                {"role": "system", "content": "If the user asks questions that are not related to the current math problem, respond only with something like: 'I'm sorry, but I can only help with the current math problem' or with a small math joke when it's appropriate, but don't continue with the explaination of the task then. Do not elaborate further on off-topic questions. Don't write anything to the task than."},
-                {"role": "system", "content": "If the user is writing something like 'Hello' or 'How are you?', respond with: 'Hello, how I can help you with your math problem?'"},
-                {"role": "system", "content": "Use only UTF-8 text characters for your results. When you try to write math equations, use plain text instead of special code, e.g. • for \\times or (25/5) instead of \\frac{25}{5}."},
-                {"role": "user", "content": content}
-            ],
-            max_tokens=1000,
-            temperature=0
-        )
+        if (session["phase"] != "questions" or 
+            session.get("certainty_pending", False) or 
+            not session.get("chat_ready", False) or
+            current_chat is None):
+            return jsonify({
+                "lines_right": session.get("lines_right", []), 
+                "error": "Chat not available",
+                "chat_ready": session.get("chat_ready", False)
+            })
         
-        assistant_response = response.choices[0].message.content
+        message = request.json.get("message", "").strip()
+        if not message:
+            return jsonify({"lines_right": session.get("lines_right", []), "error": "Empty message"})
+        
+        user_message_formatted = f"<span class='user'>You: {message}</span>"
+        append_right(user_message_formatted)
+        
+        response = current_chat.send_message(message)
+        assistant_response = response.text
+        
+        assistant_message_formatted = f"<span class='assistant'>Assistant: {assistant_response}</span>"
+        append_right(assistant_message_formatted)
+        
+        add_chat_interaction(message, assistant_response)
+        
+        return jsonify({
+            "lines_right": session.get("lines_right", []),
+            "latest_response": assistant_message_formatted,
+            "chat_ready": True
+        })
     except Exception as e:
-        print(f"OpenAI API error: {str(e)}")
-        assistant_response = f"I apologize, but I encountered an error processing your request: {str(e)}"
-    
-    formatted_response = f"<span class='assistant'>Assistant: {assistant_response}</span>"
-    
-    sm.append_right(formatted_response)
-    
-    sm.record_keeper.add_chat_interaction(message, assistant_response)
-    
-    return jsonify({
-        "lines_right": session["lines_right"],
-        "latest_response": formatted_response,
-        "question_idx": current_question_idx
-    })
+        return jsonify({"error": str(e), "chat_ready": False}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=os.getenv("PORT", default=5000))

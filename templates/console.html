@@ -24,7 +24,7 @@
         <div class="console-line">{{ line|safe }}</div>
       {% endfor %}
       <div class="input-line">
-        <span>$  </span><div id="chatInput" class="console-input" contenteditable="true"></div>
+        <span>$  </span><div id="chatInput" class="console-input" contenteditable="false"></div>
       </div>
     </div>
   </div>
@@ -35,14 +35,12 @@
             this.overlay = document.getElementById("timer-overlay");
             this.interval = null;
             this.remainingTime = 0;
-            this.phase = "question";
         }
 
-        start(minutes, forceStart = false, phase = "question") {
+        start(minutes, forceStart = false) {
             if (this.interval && !forceStart) return;
             
             this.stop();
-            this.phase = phase;
             const duration = minutes * 60 * 1000;
             const endTime = Date.now() + duration;
             
@@ -53,20 +51,24 @@
                 
                 if (this.remainingTime <= 0) {
                     this.stop();
+                    
+                    const chatInput = document.getElementById("chatInput");
+                    chatInput.setAttribute("contenteditable", "false");
+                    chatInput.style.opacity = "0.5";
+                    chatInput.style.cursor = "not-allowed";
+                    
                     const data = await leftConsole.sendInput("/command", "timeout");
                     if (data.lines_left) leftConsole.update(data.lines_left);
+                    if (data.lines_right !== undefined) rightConsole.update(data.lines_right);
                     if (data.timer_duration > 0) {
-                        this.start(data.timer_duration, true, data.waiting_phase ? "waiting" : 
-                                                               data.certainty_pending ? "certainty" : "question");
+                        this.start(data.timer_duration, true);
                     }
                     return;
                 }
                 
                 const minutes = Math.floor(this.remainingTime / 60);
                 const seconds = this.remainingTime % 60;
-                
-                let prefix = "Time remaining"
-                this.overlay.textContent = `${prefix}: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                this.overlay.textContent = `Time remaining: ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
             };
 
             updateTimer();
@@ -91,6 +93,10 @@
 
       update(lines) {
         const inputLine = this.console.querySelector(".input-line");
+        const wasInEditableState = this.input.getAttribute("contenteditable") === "true";
+        const hadFocus = document.activeElement === this.input;
+        const cursorPosition = hadFocus ? this.getCursorPosition() : null;
+        
         this.console.innerHTML = "";
         lines.forEach(ln => {
           const div = document.createElement("div");
@@ -100,15 +106,43 @@
         });
         this.console.appendChild(inputLine);
         this.console.scrollTop = this.console.scrollHeight;
-        this.input.focus();
+        
+        if (wasInEditableState && hadFocus && this.input.getAttribute("contenteditable") === "true") {
+          setTimeout(() => {
+            this.input.focus();
+            if (cursorPosition !== null) {
+              this.setCursorPosition(cursorPosition);
+            }
+          }, 10);
+        }
       }
 
-      appendLine(text) {
-        const div = document.createElement("div");
-        div.className = "console-line";
-        div.innerHTML = text;
-        this.console.insertBefore(div, this.console.querySelector(".input-line"));
-        this.console.scrollTop = this.console.scrollHeight;
+      getCursorPosition() {
+        try {
+          const selection = window.getSelection();
+          if (selection.rangeCount > 0) {
+            const range = selection.getRangeAt(0);
+            return range.startOffset;
+          }
+        } catch (e) {}
+        return null;
+      }
+
+      setCursorPosition(position) {
+        try {
+          if (this.input.childNodes.length > 0) {
+            const textNode = this.input.childNodes[0];
+            if (textNode && textNode.nodeType === Node.TEXT_NODE) {
+              const range = document.createRange();
+              const selection = window.getSelection();
+              const maxPos = Math.min(position, textNode.textContent.length);
+              range.setStart(textNode, maxPos);
+              range.setEnd(textNode, maxPos);
+              selection.removeAllRanges();
+              selection.addRange(range);
+            }
+          }
+        } catch (e) {}
       }
 
       async sendInput(endpoint, input) {
@@ -131,16 +165,27 @@
     const rightConsole = new Console("console-right", "chatInput");
     const timer = new Timer();
     let waitingPhaseChecker = null;
+    let chatReadyChecker = null;
+    let llmProcessing = false;
 
     const handleInput = async (console, endpoint) => {
         const text = console.input.innerText.trim();
         if (!text) return;
         
-        console.input.innerText = "";
-        
         if (console === rightConsole && endpoint === "/chat") {
-            console.appendLine(`$ ${text}`);
+            const statusResponse = await fetch("/status");
+            const statusData = await statusResponse.json();
+            if (!statusData.chat_ready) {
+                console.appendLine("$ Chat is not ready. Please wait...");
+                console.input.innerText = "";
+                return;
+            }
+            
+            llmProcessing = true;
+            updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, false);
         }
+        
+        console.input.innerText = "";
         
         try {
             const data = await console.sendInput(endpoint, {
@@ -150,27 +195,24 @@
             });
             
             if (data.lines_left) leftConsole.update(data.lines_left);
+            if (data.lines_right !== undefined) rightConsole.update(data.lines_right);
             
-            if (data.lines_right) {
-                if (console === rightConsole && endpoint === "/chat") {
-                    const llmResponse = data.lines_right[data.lines_right.length - 1];
-                    console.appendLine(llmResponse);
-                } else if (data.new_question === true) {
-                    rightConsole.update(data.lines_right);
-                }
+            if (console === rightConsole && endpoint === "/chat") {
+                llmProcessing = false;
+                const statusResponse = await fetch("/status");
+                const statusData = await statusResponse.json();
+                updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, statusData.chat_ready);
             }
             
             if (data.phase === "summary") {
                 timer.stop();
             } else if (console === leftConsole && data.timer_duration > 0) {
                 if (data.should_reset || !timer.interval) {
-                    const phase = data.waiting_phase ? "waiting" : 
-                                  data.certainty_pending ? "certainty" : "question";
-                    timer.start(data.timer_duration, true, phase);
+                    timer.start(data.timer_duration, true);
                 }
             }
             
-            updateInputStates(data.waiting_phase, data.certainty_pending, data.phase);
+            updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
             
             if (data.waiting_phase) {
                 setupWaitingPhaseChecker();
@@ -179,17 +221,25 @@
                 waitingPhaseChecker = null;
             }
             
+            if (data.new_question || (!data.chat_ready && data.phase === "questions" && !data.certainty_pending)) {
+                setupChatReadyChecker();
+            }
+            
             console.input.focus();
         } catch(err) {
-            console.error(err);
+            window.console.error(err);
             console.appendLine("$ Error: Could not process your request.");
+            if (console === rightConsole) {
+                llmProcessing = false;
+                const statusResponse = await fetch("/status");
+                const statusData = await statusResponse.json();
+                updateInputStates(statusData.waiting_phase, statusData.certainty_pending, statusData.phase, statusData.chat_ready);
+            }
         }
     };
 
     function setupWaitingPhaseChecker() {
-        if (waitingPhaseChecker) {
-            clearTimeout(waitingPhaseChecker);
-        }
+        if (waitingPhaseChecker) clearTimeout(waitingPhaseChecker);
         
         waitingPhaseChecker = setTimeout(async () => {
             try {
@@ -201,51 +251,78 @@
                 } else {
                     const commandData = await leftConsole.sendInput("/command", "");
                     
-                    if (commandData.lines_left) {
-                        leftConsole.update(commandData.lines_left);
-                    }
-                    if (commandData.lines_right) {
-                        rightConsole.update(commandData.lines_right);
-                    }
+                    if (commandData.lines_left) leftConsole.update(commandData.lines_left);
+                    if (commandData.lines_right !== undefined) rightConsole.update(commandData.lines_right);
                     
-                    updateInputStates(false, commandData.certainty_pending, data.phase);
+                    updateInputStates(false, commandData.certainty_pending, commandData.phase, commandData.chat_ready);
                     
                     if (commandData.timer_duration > 0) {
                         timer.start(commandData.timer_duration, true);
+                    }
+                    
+                    if (!commandData.chat_ready && commandData.phase === "questions" && !commandData.certainty_pending) {
+                        setupChatReadyChecker();
                     }
                     
                     clearTimeout(waitingPhaseChecker);
                     waitingPhaseChecker = null;
                 }
             } catch (error) {
-                console.error("Error checking waiting phase status:", error);
                 waitingPhaseChecker = setTimeout(setupWaitingPhaseChecker, 2000);
             }
         }, 1000);
     }
 
-    function updateInputStates(waitingPhase, certaintyPending, currentPhase) {
+    function setupChatReadyChecker() {
+        if (chatReadyChecker) clearInterval(chatReadyChecker);
+        
+        let updateCount = 0;
+        
+        chatReadyChecker = setInterval(async () => {
+            try {
+                const response = await fetch("/status");
+                const data = await response.json();
+                
+                updateCount++;
+                
+                const currentLinesCount = rightConsole.console.querySelectorAll('.console-line').length;
+                const shouldUpdateConsole = updateCount <= 3 || 
+                                          (data.lines_right && data.lines_right.length !== currentLinesCount);
+                
+                if (shouldUpdateConsole && data.lines_right !== undefined) {
+                    rightConsole.update(data.lines_right);
+                }
+                
+                updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
+                
+                if (data.chat_ready && !data.chat_initializing) {
+                    clearInterval(chatReadyChecker);
+                    chatReadyChecker = null;
+                }
+            } catch (error) {
+                window.console.error("Error checking chat ready status:", error);
+            }
+        }, 750);
+    }
+
+    function updateInputStates(waitingPhase, certaintyPending, currentPhase, chatReady = false) {
         const chatInput = document.getElementById("chatInput");
         const taskInput = document.getElementById("taskInput");
         
-        if (waitingPhase || certaintyPending || currentPhase === "summary") {
-            chatInput.setAttribute("contenteditable", "false");
-            chatInput.style.opacity = "0.5";
-            chatInput.style.cursor = "not-allowed";
-            
-            const disableTaskInput = waitingPhase || currentPhase === "summary";
-            taskInput.setAttribute("contenteditable", disableTaskInput ? "false" : "true");
-            taskInput.style.opacity = disableTaskInput ? "0.5" : "1";
-            taskInput.style.cursor = disableTaskInput ? "not-allowed" : "text";
-        } else {
-            chatInput.setAttribute("contenteditable", "true");
-            chatInput.style.opacity = "1";
-            chatInput.style.cursor = "text";
-            
-            taskInput.setAttribute("contenteditable", "true");
-            taskInput.style.opacity = "1";
-            taskInput.style.cursor = "text";
+        const chatEnabled = chatReady && !llmProcessing && !waitingPhase && !certaintyPending && currentPhase !== "summary";
+        
+        chatInput.setAttribute("contenteditable", chatEnabled ? "true" : "false");
+        chatInput.style.opacity = chatEnabled ? "1" : "0.5";
+        chatInput.style.cursor = chatEnabled ? "text" : "not-allowed";
+        
+        if (!chatEnabled && chatInput.innerText.trim()) {
+            chatInput.innerText = "";
         }
+        
+        const taskEnabled = !waitingPhase && currentPhase !== "summary";
+        taskInput.setAttribute("contenteditable", taskEnabled ? "true" : "false");
+        taskInput.style.opacity = taskEnabled ? "1" : "0.5";
+        taskInput.style.cursor = taskEnabled ? "text" : "not-allowed";
     }
 
     const setupConsole = (console, endpoint) => {
@@ -267,35 +344,38 @@
     setupConsole(leftConsole, "/command");
     setupConsole(rightConsole, "/chat");
 
-    if (document.getElementById("timer-overlay").style.display === 'block') {
-      timer.start();
-    }
-
-    document.getElementById("console-left").addEventListener("click", () => {
-      if (leftConsole.input.getAttribute("contenteditable") === "true") {
-        leftConsole.input.focus();
-      }
-    });
-
     document.getElementById("console-right").addEventListener("click", () => {
-      if (rightConsole.input.getAttribute("contenteditable") === "true") {
-        rightConsole.input.focus();
+      const chatInput = document.getElementById("chatInput");
+      if (chatInput.getAttribute("contenteditable") === "true") {
+        chatInput.focus();
+        const range = document.createRange();
+        const sel = window.getSelection();
+        range.selectNodeContents(chatInput);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
       }
     });
 
     fetch("/status").then(r => r.json()).then(data => {
         if (data.timer_duration > 0) {
-            const phase = data.waiting_phase ? "waiting" : 
-                          data.certainty_pending ? "certainty" : "question";
-            timer.start(data.timer_duration, true, phase);
+            timer.start(data.timer_duration, true);
         } else if (data.phase === "summary") {
             timer.stop();
         }
         
-        updateInputStates(data.waiting_phase, data.certainty_pending, data.phase);
+        updateInputStates(data.waiting_phase, data.certainty_pending, data.phase, data.chat_ready);
         
         if (data.waiting_phase) {
             setupWaitingPhaseChecker();
+        }
+        
+        if (data.chat_initializing || (data.phase === "questions" && !data.chat_ready && !data.certainty_pending)) {
+            setupChatReadyChecker();
+        }
+        
+        if (data.lines_right !== undefined) {
+            rightConsole.update(data.lines_right);
         }
     });
   </script>
