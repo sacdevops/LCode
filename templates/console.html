@@ -207,7 +207,17 @@
                 waitingPhaseChecker = null;
             }
             
-            console.input.focus();
+            // Focus the appropriate input field after processing
+            if (console === rightConsole && endpoint === "/chat") {
+                // After chat response, focus chat input if it's enabled
+                setTimeout(() => {
+                    if (rightConsole.input.getAttribute("contenteditable") === "true") {
+                        rightConsole.input.focus();
+                    }
+                }, 100);
+            } else {
+                console.input.focus();
+            }
         } catch(err) {
             window.console.error(err);
             if (console === rightConsole) {

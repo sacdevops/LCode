@@ -6,6 +6,7 @@ import secrets
 import random
 import json
 import shutil
+import threading
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -285,8 +286,13 @@ def add_chat_interaction(user_msg, assistant_msg):
     if session["record_data"]["current_task"]:
         session["record_data"]["current_task"]["chat_history"].append({
             "timestamp": time.time(),
-            "user": user_msg,
-            "assistant": assistant_msg
+            "role": "user",
+            "message": user_msg
+        })
+        session["record_data"]["current_task"]["chat_history"].append({
+            "timestamp": time.time(),
+            "role": "assistant", 
+            "message": assistant_msg
         })
 
 def complete_task(answer, certainty, time_spent):
@@ -303,10 +309,12 @@ def complete_task(answer, certainty, time_spent):
 def save_results(stats):
     final_data = {
         "prolific_id": session["prolific_id"],
+        "session_id": session["session_id"],
         "group": "treatment" if session["treatment_group"] else "control",
+        "statistics": stats,
+        "timestamp": time.time(),
         "test_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "test"],
         "main_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "main"],
-        "statistics": stats
     }
     
     try:
@@ -318,32 +326,49 @@ def save_results(stats):
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(final_data, f, ensure_ascii=False, indent=2)
 
+        # Asynchroner Upload zu Sciebo
         if webdav_client:
-            upload_to_sciebo(filepath, filename)
+            upload_to_sciebo_async(filepath, filename)
         
     except Exception as e:
         print(f"Error saving results: {e}")
 
-def upload_to_sciebo(filepath, filename):
-    if not webdav_client:
-        return
-        
-    remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
-    
-    for attempt in range(3):
-        try:
-            webdav_client.upload_file(remote_path=remote_path, local_path=filepath)
-            os.remove(filepath)
+def upload_to_sciebo_async(filepath, filename):
+    """Asynchrone Upload-Funktion für Sciebo"""
+    def upload_worker():
+        if not webdav_client:
             return
-        except Exception:
-            if attempt < 2:
-                time.sleep(2)
+            
+        remote_path = os.path.join(os.getenv('SCIEBO_DIRECTORY', ''), filename).replace('\\', '/')
+        
+        for attempt in range(3):
+            try:
+                webdav_client.upload_file(remote_path=remote_path, local_path=filepath)
+                # Datei nur löschen wenn Upload erfolgreich war
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                print(f"Successfully uploaded {filename} to Sciebo")
+                return
+            except Exception as e:
+                print(f"Upload attempt {attempt + 1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2)
+        
+        # Falls alle Upload-Versuche fehlschlagen, Backup erstellen
+        backup_path = filepath.replace(".json", f"_backup_{int(time.time())}.json")
+        try:
+            shutil.copy(filepath, backup_path)
+            print(f"Created backup: {backup_path}")
+        except Exception as e:
+            print(f"Failed to create backup: {e}")
     
-    backup_path = filepath.replace(".json", f"_backup_{int(time.time())}.json")
-    try:
-        shutil.copy(filepath, backup_path)
-    except Exception:
-        pass
+    # Upload in separatem Thread starten
+    upload_thread = threading.Thread(target=upload_worker, daemon=True)
+    upload_thread.start()
+
+def upload_to_sciebo(filepath, filename):
+    """Synchrone Upload-Funktion (Legacy) - wird durch asynchrone Version ersetzt"""
+    upload_to_sciebo_async(filepath, filename)
 
 def handle_input(user_input):
     if session["phase"] == "prolific":
@@ -379,6 +404,8 @@ def handle_answer(user_input):
     if not user_input or user_input.lower() not in valid_letters:
         if user_input:
             append_left("$  Invalid letter.")
+        # Ensure we don't have any residual state from invalid input
+        session["certainty_pending"] = False
         return
     
     task = get_current_task()
@@ -394,6 +421,8 @@ def handle_answer(user_input):
     answer_idx = ord(user_input.lower()) - ord('a')
     if answer_idx >= len(session.get('current_options', [])):
         append_left("$  Invalid option.")
+        # Ensure we don't have any residual state from invalid input
+        session["certainty_pending"] = False
         return
         
     chosen = session['current_options'][answer_idx]
@@ -489,6 +518,7 @@ def handle_certainty(user_input):
         certainty = int(user_input)
     else:
         append_left("$  Invalid input. Please enter a number between 1-4:")
+        # Don't change certainty_pending state for invalid input
         return
     
     session["current_result"]["certainty"] = certainty
@@ -686,7 +716,6 @@ def chat():
                     model=LLM_MODEL,
                     config=types.GenerateContentConfig(
                         system_instruction=system_prompt,
-                        max_output_tokens=1000,
                         temperature=0,
                         response_modalities=["TEXT"]
                     )
