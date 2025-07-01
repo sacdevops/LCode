@@ -9,16 +9,13 @@ MAIN_TASKS_COUNT = 5
 # Number of answer options for each question
 NUM_ANSWERS = 4
 
-# Group
-TREATMENT_GROUP = True
-
 # Time limits in seconds
 QUESTION_TIME_SECONDS = 180
 CERTAINTY_TIME_SECONDS = 30
 WAITING_TIME_SECONDS = 5
 
 # Group-specific prompt engineering templates
-TREATMENT_GROUP_PROMPT = """ You are a Mathematical Assistant. Your task is to assist users in solving math problems. You never provide them with the correct answer, but assist them in finding the right answer.
+TREATMENT_GROUP_PROMPT = """You are a Mathematical Assistant. Your task is to assist users in solving math problems. You never provide them with the correct answer, but assist them in finding the right answer.
 Your language is active and cooperative.
 **Concise**:
 Support participants in solving math problems using active and cooperative language.

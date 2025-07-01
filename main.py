@@ -100,7 +100,7 @@ def init_session():
         "prolific_id": None,
         "certainty_pending": False,
         "current_result": None,
-        "treatment_group": config.TREATMENT_GROUP,
+        "treatment_group": os.getenv('TREATMENT_GROUP', 'True').lower() == 'true',
         "current_phase": "test",
         "waiting_start_time": None,
         "record_data": {"records": [], "current_task": None},
