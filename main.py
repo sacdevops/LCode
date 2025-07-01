@@ -29,6 +29,69 @@ app.config["SESSION_PERMANENT"] = False
 task_cache = {"test": None, "main": None}
 current_chat_session = None
 
+# Globaler In-Memory Cache für Session-Daten
+app_cache = {
+    'sessions': {},  # session_id -> session_data
+    'lock': threading.RLock()
+}
+
+def get_session_cache():
+    """Hole Session-Cache für aktuelle Session"""
+    session_id = session.get("session_id")
+    if not session_id:
+        return {}
+    
+    with app_cache['lock']:
+        if session_id not in app_cache['sessions']:
+            app_cache['sessions'][session_id] = {
+                'lines_left': [],
+                'lines_right': [],
+                'results': [],
+                'record_data': {"records": [], "current_task": None},
+                'current_result': None,
+                'current_options': [],
+                'current_task_key': None,
+                'last_access': time.time()
+            }
+        
+        # Update last access time
+        app_cache['sessions'][session_id]['last_access'] = time.time()
+        return app_cache['sessions'][session_id]
+
+def update_session_cache(updates):
+    """Update Session-Cache"""
+    session_id = session.get("session_id")
+    if not session_id:
+        return
+    
+    with app_cache['lock']:
+        cache = get_session_cache()
+        cache.update(updates)
+
+def cleanup_old_cache_entries():
+    """Lösche alte Cache-Einträge (älter als 2 Stunden)"""
+    cutoff_time = time.time() - (2 * 60 * 60)
+    
+    with app_cache['lock']:
+        expired_sessions = [
+            sid for sid, data in app_cache['sessions'].items()
+            if data.get('last_access', 0) < cutoff_time
+        ]
+        
+        for sid in expired_sessions:
+            del app_cache['sessions'][sid]
+
+# Periodisches Cleanup
+def schedule_cleanup():
+    cleanup_old_cache_entries()
+    # Schedule next cleanup in 30 minutes
+    timer = threading.Timer(30 * 60, schedule_cleanup)
+    timer.daemon = True
+    timer.start()
+
+# Start cleanup scheduler
+schedule_cleanup()
+
 webdav_options = {
     'webdav_hostname': os.getenv('SCIEBO_URL'),
     'webdav_login': os.getenv('SCIEBO_LOGIN'),
@@ -91,42 +154,36 @@ def prepare_options(task):
 def init_session():
     defaults = {
         "phase": "prolific",
-        "lines_left": [],
-        "lines_right": [],
         "test_idx": 0,
         "main_idx": 0,
-        "results": [],
         "start_time": None,
         "prolific_id": None,
         "certainty_pending": False,
-        "current_result": None,
         "treatment_group": os.getenv('TREATMENT_GROUP', 'True').lower() == 'true',
         "current_phase": "test",
         "waiting_start_time": None,
-        "record_data": {"records": [], "current_task": None},
         "session_id": secrets.token_hex(16),
-        "current_options": [],
-        "current_task_key": None,
         "is_first_message": False
     }
     
+    # Nur kleine Daten in Flask Session
     for key, value in defaults.items():
         if key not in session:
             session[key] = value
+    
+    # Große Daten im App-Cache initialisieren
+    get_session_cache()  # This creates the cache entry if it doesn't exist
 
 def clear_console():
-    session["lines_left"] = []
-    session["lines_right"] = []
+    update_session_cache({"lines_left": [], "lines_right": []})
 
 def append_left(txt):
-    if "lines_left" not in session:
-        session["lines_left"] = []
-    session["lines_left"].append(txt)
+    cache = get_session_cache()
+    cache['lines_left'].append(txt)
 
 def append_right(txt):
-    if "lines_right" not in session:
-        session["lines_right"] = []
-    session["lines_right"].append(txt)
+    cache = get_session_cache()
+    cache['lines_right'].append(txt)
 
 def get_current_task():
     tasks = load_tasks()
@@ -149,7 +206,8 @@ def show_question():
     clear_console()
     session["start_time"] = time.time()
     
-    session["lines_right"] = []
+    # Clear chat history for new question
+    update_session_cache({"lines_right": []})
     current_chat_session = None
     session["is_first_message"] = False
     
@@ -166,7 +224,8 @@ def show_question():
     total = config.TEST_TASKS_COUNT if phase == "test" else config.MAIN_TASKS_COUNT
     prefix = "PRACTICE QUESTION" if phase == "test" else "QUESTION"
     
-    session["current_task_key"] = f"{phase}_{idx}"
+    # Store current task key in cache
+    update_session_cache({"current_task_key": f"{phase}_{idx}"})
     
     append_left(f"$  {prefix} {idx+1}/{total}\n")
     
@@ -178,7 +237,7 @@ def show_question():
     append_left(f"   {task['question']}")
     
     options = prepare_options(task)
-    session['current_options'] = options
+    update_session_cache({"current_options": options})
     
     start_task_record(idx, task, options, phase)
     
@@ -220,7 +279,8 @@ def show_waiting_phase():
         show_question()
 
 def show_summary():
-    main_results = [r for r in session["results"] if r.get("task_type", "main") == "main"]
+    cache = get_session_cache()
+    main_results = [r for r in cache.get('results', []) if r.get("task_type", "main") == "main"]
     stats = calculate_stats(main_results)
     save_results(stats)
     
@@ -269,7 +329,9 @@ def generate_summary_footer(stats):
     Group: {"treatment" if session["treatment_group"] else "control"}"""
 
 def start_task_record(task_idx, task, options, task_type):
-    session["record_data"]["current_task"] = {
+    cache = get_session_cache()
+    record_data = cache.get('record_data', {"records": [], "current_task": None})
+    record_data["current_task"] = {
         "task_index": task_idx,
         "question": task["question"],
         "options": options,
@@ -281,40 +343,50 @@ def start_task_record(task_idx, task, options, task_type):
         "certainty": None,
         "task_type": task_type
     }
+    update_session_cache({"record_data": record_data})
 
 def add_chat_interaction(user_msg, assistant_msg):
-    if session["record_data"]["current_task"]:
-        session["record_data"]["current_task"]["chat_history"].append({
+    cache = get_session_cache()
+    record_data = cache.get('record_data', {"records": [], "current_task": None})
+    if record_data.get("current_task"):
+        record_data["current_task"]["chat_history"].append({
             "timestamp": time.time(),
             "role": "user",
             "message": user_msg
         })
-        session["record_data"]["current_task"]["chat_history"].append({
+        record_data["current_task"]["chat_history"].append({
             "timestamp": time.time(),
             "role": "assistant", 
             "message": assistant_msg
         })
+        update_session_cache({"record_data": record_data})
 
 def complete_task(answer, certainty, time_spent):
-    if session["record_data"]["current_task"]:
-        current = session["record_data"]["current_task"]
+    cache = get_session_cache()
+    record_data = cache.get('record_data', {"records": [], "current_task": None})
+    if record_data.get("current_task"):
+        current = record_data["current_task"]
         current.update({
             "final_answer": answer,
             "certainty": certainty,
             "time_spent": time_spent
         })
-        session["record_data"]["records"].append(current)
-        session["record_data"]["current_task"] = None
+        record_data["records"].append(current)
+        record_data["current_task"] = None
+        update_session_cache({"record_data": record_data})
 
 def save_results(stats):
+    cache = get_session_cache()
+    record_data = cache.get('record_data', {"records": [], "current_task": None})
+    
     final_data = {
         "prolific_id": session["prolific_id"],
         "session_id": session["session_id"],
         "group": "treatment" if session["treatment_group"] else "control",
         "statistics": stats,
         "timestamp": time.time(),
-        "test_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "test"],
-        "main_tasks": [r for r in session["record_data"]["records"] if r["task_type"] == "main"],
+        "test_tasks": [r for r in record_data["records"] if r["task_type"] == "test"],
+        "main_tasks": [r for r in record_data["records"] if r["task_type"] == "main"],
     }
     
     try:
@@ -379,9 +451,10 @@ def handle_input(user_input):
                 "current_phase": "test",
                 "test_idx": 0,
                 "main_idx": 0,
-                "results": [],
                 "certainty_pending": False
             })
+            # Clear results in cache
+            update_session_cache({"results": []})
             show_question()
         else:
             append_left("$  Invalid Prolific ID. Please try again:")
@@ -418,17 +491,20 @@ def handle_answer(user_input):
         handle_timeout()
         return
     
+    cache = get_session_cache()
+    current_options = cache.get('current_options', [])
     answer_idx = ord(user_input.lower()) - ord('a')
-    if answer_idx >= len(session.get('current_options', [])):
+    
+    if answer_idx >= len(current_options):
         append_left("$  Invalid option.")
         # Ensure we don't have any residual state from invalid input
         session["certainty_pending"] = False
         return
         
-    chosen = session['current_options'][answer_idx]
+    chosen = current_options[answer_idx]
     correct = (chosen == task["correct_solution"])
 
-    session["current_result"] = {
+    current_result = {
         "question": task["question"],
         "chosen_option": chosen,
         "correct_option": task["correct_solution"],
@@ -437,6 +513,8 @@ def handle_answer(user_input):
         "task_type": session["current_phase"]
     }
     
+    update_session_cache({"current_result": current_result})
+    
     ask_certainty()
 
 def handle_timeout():
@@ -444,28 +522,34 @@ def handle_timeout():
     if not task:
         return
     
+    cache = get_session_cache()
+    
     if session.get("certainty_pending", False):
-        session["current_result"]["certainty"] = 0
-        session["results"].append(session["current_result"])
-        
-        complete_task(
-            session["current_result"]["chosen_option"],
-            0,
-            session["current_result"]["time_spent"]
-        )
-        
-        session["current_result"] = None
-        session["certainty_pending"] = False
-        
-        append_left("$  TIME'S UP! Moving to next question...")
-        
-        session["lines_right"] = []
-        
-        advance_question()
-        return
+        current_result = cache.get("current_result")
+        if current_result:
+            current_result["certainty"] = 0
+            results = cache.get("results", [])
+            results.append(current_result)
+            update_session_cache({"results": results})
+            
+            complete_task(
+                current_result["chosen_option"],
+                0,
+                current_result["time_spent"]
+            )
+            
+            update_session_cache({"current_result": None})
+            session["certainty_pending"] = False
+            
+            append_left("$  TIME'S UP! Moving to next question...")
+            
+            update_session_cache({"lines_right": []})
+            
+            advance_question()
+            return
     
     # Time expired during main question - skip certainty and move to next question
-    session["current_result"] = {
+    current_result = {
         "question": task["question"],
         "chosen_option": "TIMEOUT",
         "correct_option": task["correct_solution"],
@@ -475,7 +559,9 @@ def handle_timeout():
         "task_type": session["current_phase"]
     }
     
-    session["results"].append(session["current_result"])
+    results = cache.get("results", [])
+    results.append(current_result)
+    update_session_cache({"results": results})
     
     complete_task(
         "TIMEOUT",
@@ -485,17 +571,19 @@ def handle_timeout():
     
     append_left("$  TIME'S UP! Moving to next question...")
     
-    session["current_result"] = None
+    update_session_cache({"current_result": None})
     session["certainty_pending"] = False
-    session["lines_right"] = []
+    update_session_cache({"lines_right": []})
     
     advance_question()
 
 def ask_certainty():
     session["certainty_pending"] = True
     
-    chosen_option = session['current_result']['chosen_option']
-    current_options = session.get('current_options', [])
+    cache = get_session_cache()
+    current_result = cache.get('current_result', {})
+    chosen_option = current_result.get('chosen_option', '')
+    current_options = cache.get('current_options', [])
     
     if chosen_option != "TIMEOUT" and chosen_option in current_options:
         answer_idx = current_options.index(chosen_option)
@@ -521,16 +609,22 @@ def handle_certainty(user_input):
         # Don't change certainty_pending state for invalid input
         return
     
-    session["current_result"]["certainty"] = certainty
-    session["results"].append(session["current_result"])
+    cache = get_session_cache()
+    current_result = cache.get("current_result")
+    if current_result:
+        current_result["certainty"] = certainty
+        results = cache.get("results", [])
+        results.append(current_result)
+        update_session_cache({"results": results})
+        
+        complete_task(
+            current_result["chosen_option"],
+            certainty,
+            current_result["time_spent"]
+        )
+        
+        update_session_cache({"current_result": None})
     
-    complete_task(
-        session["current_result"]["chosen_option"],
-        certainty,
-        session["current_result"]["time_spent"]
-    )
-    
-    session["current_result"] = None
     session["certainty_pending"] = False
     advance_question()
 
@@ -544,8 +638,8 @@ def advance_question():
     else:
         session["main_idx"] += 1
     
-    session["lines_right"] = []
-    session["current_task_key"] = None
+    update_session_cache({"lines_right": []})
+    update_session_cache({"current_task_key": None})
     current_chat_session = None
     session["is_first_message"] = False
     
@@ -562,7 +656,9 @@ def before_request():
 
 @app.route("/")
 def home():
-    if session["phase"] == "prolific" and not session["lines_left"]:
+    cache = get_session_cache()
+    
+    if session["phase"] == "prolific" and not cache.get("lines_left"):
         time_str = f"{config.QUESTION_TIME_SECONDS} seconds"
         if config.QUESTION_TIME_SECONDS >= 60:
             minutes = config.QUESTION_TIME_SECONDS // 60
@@ -585,8 +681,8 @@ def home():
         append_left("$  Please enter your Prolific ID to begin:")
         
     return render_template("console.html", 
-                         lines_left=session.get("lines_left", []), 
-                         lines_right=session.get("lines_right", []),
+                         lines_left=cache.get("lines_left", []), 
+                         lines_right=cache.get("lines_right", []),
                          session=session)
 
 @app.route("/status")
@@ -612,6 +708,8 @@ def status():
         timer_duration = remaining / 60
         should_reset = True
     
+    cache = get_session_cache()
+    
     return jsonify({
         "timer_duration": timer_duration,
         "should_reset": should_reset,
@@ -619,7 +717,7 @@ def status():
         "certainty_pending": session.get("certainty_pending", False),
         "phase": session["phase"],
         "waiting_phase": session["phase"] == "waiting",
-        "lines_right": session.get("lines_right", [])
+        "lines_right": cache.get("lines_right", [])
     })
 
 @app.route("/command", methods=["POST"])
@@ -669,9 +767,11 @@ def command():
             timer_duration = remaining / 60
             should_reset = True
         
+        cache = get_session_cache()
+        
         return jsonify({
-            "lines_left": session.get("lines_left", []),
-            "lines_right": session.get("lines_right", []),
+            "lines_left": cache.get("lines_left", []),
+            "lines_right": cache.get("lines_right", []),
             "timer_duration": timer_duration,
             "should_reset": should_reset,
             "certainty_pending": session.get("certainty_pending", False),
@@ -689,21 +789,24 @@ def chat():
     try:
         if (session["phase"] != "questions" or 
             session["phase"] == "waiting"):
+            cache = get_session_cache()
             return jsonify({
-                "lines_right": session.get("lines_right", []), 
+                "lines_right": cache.get("lines_right", []), 
                 "error": "Chat not available"
             })
         
         message = request.json.get("message", "").strip()
         if not message:
-            return jsonify({"lines_right": session.get("lines_right", []), "error": "Empty message"})
+            cache = get_session_cache()
+            return jsonify({"lines_right": cache.get("lines_right", []), "error": "Empty message"})
         
         user_message_formatted = f"<span class='user'>You: {message}</span>"
         append_right(user_message_formatted)
         
-        task_key = session.get("current_task_key")
+        cache = get_session_cache()
+        task_key = cache.get("current_task_key")
         if not task_key:
-            return jsonify({"error": "No active task", "lines_right": session.get("lines_right", [])})
+            return jsonify({"error": "No active task", "lines_right": cache.get("lines_right", [])})
         
         is_first_message = not session.get("is_first_message", False)
 
@@ -762,8 +865,10 @@ def chat():
         
         add_chat_interaction(message, assistant_response)
         
+        cache = get_session_cache()
+        
         return jsonify({
-            "lines_right": session.get("lines_right", []),
+            "lines_right": cache.get("lines_right", []),
             "latest_response": assistant_message_formatted
         })
     except Exception as e:
