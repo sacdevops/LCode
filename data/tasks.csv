@@ -1,15 +1,5 @@
 question;options;correct_solution;image_path;task_type
-In the figure above, the ratio of the length of line AB to the length of line AC is 2 : 5. If AC = 25, what is the length of line AB?;"4;5;6;7;8;10;11;12;14;15;16;18;20;22";10;54;test
-In the figure above, l || m. Which of the following must equal 180?;"k + n + s; n + p + s; k + p + s; p + r + n; r + t + n; k + n + t";k + p + s;798;test
-In the figure above, ABCDEF is a regular hexagon, and its center is point O. What is the value of x?;"30°;45°;60°;72°;90°;108°;120°;135°;150°;180°;210°;240°;270°;360°";60°;280;main
-As shown in the figure, line segment AB = 10.0, M is the midpoint of line segment AB, C is the midpoint of line segment MB, N is a point of line segment AM, and MN = 1.0, the length of line segment NC ();"1.0;1.5;2.0;2.5;3.0;3.5;4.0;4.5;5.0;5.5;6.0;6.5;7.0;7.5";3.5;669;main
 In the figure above, AC = 6 and BC = 3. Point P lies on line AB between A and B such that line CP is perpendicular to line AB. Which of the following could be the length of line CP?;"1;1.25;1.5;2;2.7;3;3.5;4;4.2;5;5.1;6;7;8";2;599;test
-As shown in the figure, in the circle O with a radius of 5.0, the length of the chord AB is 8.0, then the distance from the center O to the chord AB is ();"1;2;8;9";2;505;main
-Find the area of the figure. Round to the nearest tenth if necessary.;"2250ft²;2251ft²;2252ft²;2253ft²;2254ft²;2255ft²;2256ft²;2257ft²;2258ft²;2259ft²;2260ft²;2261ft²;2262ft²;2263ft²";2256ft²;318;main
-As shown in the figure, the parallel lines a and b are intercepted by the straight line c. If ∠1 = 50.0, then the degree of ∠2 is ();"30°;45°;50°;60°;75°;90°;100°;105°;115°;130°;150°;180°;360°";130°;355;main
-Find $x$ so that $a ∥ b$.;"1;2;3;4;5;6;7;8;9;10";2;855;main
-In the diagram above, lines M and N are parallel. All of the following are true except;"1;2;3;4;5;6;7;8;9;10";2;690;main
 If x = 32 and r = 18, what is the length of the arc shown in the figure above?;"8π;16π/5;12π;18π/5;20π;24π/5;32π/5;40π/5;36π/5;48π/5;64π/5;72π/5;96π/5;80π/5";16π/5;455;main
-As shown in the figure, in the diamond ABCD, two diagonal lines AC = 12.0, BD = 16.0, then the edge length of this diamond is ();"6,5;8;9,8;10;10,5;11,5;12;12,3;12,5;13,75;14;15;16;18";10;478;main
 As shown in the figure, PA and PB are tangent to ⊙O to A and B respectively. Point C and point D are the moving points on line segments PA and PB, and CD always remains tangent to circle O. If PA = 8.0, then perimeter of △PCD is ();"1;2;3;4;5;6;7;8;9;10";2;549;main
 As shown in the figure, the light source P is directly above the crossbar AB, the shadow of AB under the light is CD, AB ∥ CD, AB = 2.0, CD = 5.0, the distance between point P and CD is 3.0, then the distance between AB and CD is ().;"1.5;1.6;1.7;1.8;1.9;2.0;2.1;2.2;2.3;2.4;2.5;2.6;2.7;2.8";1.8;708;main

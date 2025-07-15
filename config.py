@@ -3,16 +3,16 @@ Configuration settings for the application
 """
 
 # Number of tasks for test and main phases
-TEST_TASKS_COUNT = 2
-MAIN_TASKS_COUNT = 5
+TEST_TASKS_COUNT = 1
+MAIN_TASKS_COUNT = 3
 
 # Number of answer options for each question
 NUM_ANSWERS = 4
 
 # Time limits in seconds
-QUESTION_TIME_SECONDS = 180
+QUESTION_TIME_SECONDS = 420
 CERTAINTY_TIME_SECONDS = 30
-WAITING_TIME_SECONDS = 5
+WAITING_TIME_SECONDS = 10
 
 # Group-specific prompt engineering templates
 TREATMENT_GROUP_PROMPT = """You are a Mathematical Assistant. Your task is to assist users in solving math problems. You never provide them with the correct answer, but assist them in finding the right answer.
