@@ -221,7 +221,7 @@
             }
         } catch(err) {
             window.console.error(err);
-            if (console === rightConsole) {
+            if (console === rightConsole && endpoint === "/chat") {
                 llmProcessing = false;
             }
             updateInputStates();
@@ -278,6 +278,15 @@
             
             if (!chatEnabled && chatInput.innerText.trim()) {
                 chatInput.innerText = "";
+            }
+            
+            // Add visual feedback when LLM is processing
+            if (llmProcessing) {
+                chatInput.setAttribute("data-placeholder", "Assistant is thinking...");
+                chatInput.classList.add("processing");
+            } else {
+                chatInput.removeAttribute("data-placeholder");
+                chatInput.classList.remove("processing");
             }
             
             const taskEnabled = (data.phase === "questions" || data.phase === "prolific") && 

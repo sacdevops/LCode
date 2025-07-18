@@ -337,11 +337,11 @@ def start_task_record(task_idx, task, options, task_type):
         "options": options,
         "solution": task["correct_solution"],
         "user_inputs": [],
-        "chat_history": [],
         "time_spent": 0,
         "final_answer": None,
         "certainty": None,
-        "task_type": task_type
+        "task_type": task_type,
+        "chat_history": []
     }
     update_session_cache({"record_data": record_data})
 
@@ -358,6 +358,18 @@ def add_chat_interaction(user_msg, assistant_msg):
             "timestamp": time.time(),
             "role": "assistant", 
             "message": assistant_msg
+        })
+        update_session_cache({"record_data": record_data})
+
+def add_user_input(input_text, input_type="answer"):
+    """Speichere User-Input in der aktuellen Task"""
+    cache = get_session_cache()
+    record_data = cache.get('record_data', {"records": [], "current_task": None})
+    if record_data.get("current_task"):
+        record_data["current_task"]["user_inputs"].append({
+            "timestamp": time.time(),
+            "input": input_text,
+            "type": input_type
         })
         update_session_cache({"record_data": record_data})
 
@@ -476,6 +488,8 @@ def handle_answer(user_input):
     valid_letters = [chr(ord('a') + x) for x in range(config.NUM_ANSWERS)]
     if not user_input or user_input.lower() not in valid_letters:
         if user_input:
+            # Speichere auch ungültige Eingaben
+            add_user_input(user_input, "invalid_answer")
             append_left("$  Invalid letter.")
         # Ensure we don't have any residual state from invalid input
         session["certainty_pending"] = False
@@ -496,6 +510,8 @@ def handle_answer(user_input):
     answer_idx = ord(user_input.lower()) - ord('a')
     
     if answer_idx >= len(current_options):
+        # Speichere auch ungültige Optionen
+        add_user_input(user_input.upper(), "invalid_option")
         append_left("$  Invalid option.")
         # Ensure we don't have any residual state from invalid input
         session["certainty_pending"] = False
@@ -503,6 +519,9 @@ def handle_answer(user_input):
         
     chosen = current_options[answer_idx]
     correct = (chosen == task["correct_solution"])
+
+    # Speichere die User-Antwort
+    add_user_input(user_input.upper(), "answer")
 
     current_result = {
         "question": task["question"],
@@ -525,6 +544,8 @@ def handle_timeout():
     cache = get_session_cache()
     
     if session.get("certainty_pending", False):
+        # Speichere Timeout bei Certainty-Frage
+        add_user_input("timeout", "timeout_certainty")
         current_result = cache.get("current_result")
         if current_result:
             current_result["certainty"] = 0
@@ -549,6 +570,9 @@ def handle_timeout():
             return
     
     # Time expired during main question - skip certainty and move to next question
+    # Speichere Timeout bei Hauptfrage
+    add_user_input("timeout", "timeout_answer")
+    
     current_result = {
         "question": task["question"],
         "chosen_option": "TIMEOUT",
@@ -602,9 +626,15 @@ def ask_certainty():
 def handle_certainty(user_input):
     if user_input == "timeout":
         certainty = 0
+        # Speichere Timeout bei Certainty
+        add_user_input("timeout", "timeout_certainty")
     elif user_input in ["1", "2", "3", "4"]:
         certainty = int(user_input)
+        # Speichere die Certainty-Antwort
+        add_user_input(user_input, "certainty")
     else:
+        # Speichere auch ungültige Certainty-Eingaben
+        add_user_input(user_input, "invalid_certainty")
         append_left("$  Invalid input. Please enter a number between 1-4:")
         # Don't change certainty_pending state for invalid input
         return
@@ -820,7 +850,7 @@ def chat():
                     config=types.GenerateContentConfig(
                         system_instruction=system_prompt,
                         temperature=0,
-                        response_modalities=["TEXT"]
+                        response_modalities=["TEXT"],
                     )
                 )
                 
