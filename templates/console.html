@@ -166,16 +166,22 @@
     let waitingPhaseChecker = null;
     let llmProcessing = false;
 
+    // Debug: Initial state
+    window.console.log("Initial llmProcessing state:", llmProcessing);
+
     const handleInput = async (console, endpoint) => {
         const text = console.input.innerText.trim();
         if (!text) return;
         
+        // Sofort den Text löschen für bessere UX
+        console.input.innerText = "";
+        
         if (console === rightConsole && endpoint === "/chat") {
             llmProcessing = true;
+            window.console.log("LLM Processing started");
+            // Sofortige UI-Aktualisierung
             updateInputStates();
         }
-        
-        console.input.innerText = "";
         
         try {
             const data = await console.sendInput(endpoint, {
@@ -187,10 +193,6 @@
             if (data.lines_left) leftConsole.update(data.lines_left);
             if (data.lines_right !== undefined) rightConsole.update(data.lines_right);
             
-            if (console === rightConsole && endpoint === "/chat") {
-                llmProcessing = false;
-            }
-            
             if (data.phase === "summary") {
                 timer.stop();
             } else if (console === leftConsole && data.timer_duration > 0) {
@@ -198,8 +200,6 @@
                     timer.start(data.timer_duration, true);
                 }
             }
-            
-            updateInputStates();
             
             if (data.waiting_phase) {
                 setupWaitingPhaseChecker();
@@ -221,8 +221,11 @@
             }
         } catch(err) {
             window.console.error(err);
+        } finally {
+            // Stelle sicher, dass llmProcessing immer zurückgesetzt wird
             if (console === rightConsole && endpoint === "/chat") {
                 llmProcessing = false;
+                window.console.log("LLM Processing finished");
             }
             updateInputStates();
         }
@@ -259,46 +262,47 @@
         }, 1000);
     }
 
-    async function updateInputStates() {
-        try {
-            const response = await fetch("/status");
-            const data = await response.json();
-            
-            const chatInput = document.getElementById("chatInput");
-            const taskInput = document.getElementById("taskInput");
-            
-            const chatEnabled = !llmProcessing && 
-                               data.phase === "questions" && 
-                               !data.waiting_phase &&
-                               !data.certainty_pending;
-            
-            chatInput.setAttribute("contenteditable", chatEnabled ? "true" : "false");
-            chatInput.style.opacity = chatEnabled ? "1" : "0.5";
-            chatInput.style.cursor = chatEnabled ? "text" : "not-allowed";
-            
-            if (!chatEnabled && chatInput.innerText.trim()) {
-                chatInput.innerText = "";
-            }
-            
-            // Add visual feedback when LLM is processing
-            if (llmProcessing) {
-                chatInput.setAttribute("data-placeholder", "Assistant is thinking...");
-                chatInput.classList.add("processing");
-            } else {
-                chatInput.removeAttribute("data-placeholder");
-                chatInput.classList.remove("processing");
-            }
-            
-            const taskEnabled = (data.phase === "questions" || data.phase === "prolific") && 
-                               !data.waiting_phase;
-            
-            taskInput.setAttribute("contenteditable", taskEnabled ? "true" : "false");
-            taskInput.style.opacity = taskEnabled ? "1" : "0.5";
-            taskInput.style.cursor = taskEnabled ? "text" : "not-allowed";
-            
-        } catch (error) {
-            console.error("Error updating input states:", error);
-        }
+    function updateInputStates() {
+        fetch("/status")
+            .then(response => response.json())
+            .then(data => {
+                const chatInput = document.getElementById("chatInput");
+                const taskInput = document.getElementById("taskInput");
+                
+                const chatEnabled = !llmProcessing && 
+                                   data.phase === "questions" && 
+                                   !data.waiting_phase &&
+                                   !data.certainty_pending;
+                
+                chatInput.setAttribute("contenteditable", chatEnabled ? "true" : "false");
+                chatInput.style.opacity = chatEnabled ? "1" : "0.5";
+                chatInput.style.cursor = chatEnabled ? "text" : "not-allowed";
+                
+                if (!chatEnabled && chatInput.innerText.trim()) {
+                    chatInput.innerText = "";
+                }
+                
+                // Add visual feedback when LLM is processing
+                if (llmProcessing) {
+                    chatInput.setAttribute("data-placeholder", "Assistant is thinking...");
+                    chatInput.classList.add("processing");
+                    // Debug: Log when processing state is set
+                    window.console.log("LLM Processing active - showing thinking message");
+                } else {
+                    chatInput.removeAttribute("data-placeholder");
+                    chatInput.classList.remove("processing");
+                }
+                
+                const taskEnabled = (data.phase === "questions" || data.phase === "prolific") && 
+                                   !data.waiting_phase;
+                
+                taskInput.setAttribute("contenteditable", taskEnabled ? "true" : "false");
+                taskInput.style.opacity = taskEnabled ? "1" : "0.5";
+                taskInput.style.cursor = taskEnabled ? "text" : "not-allowed";
+            })
+            .catch(error => {
+                window.console.error("Error updating input states:", error);
+            });
     }
 
     const setupConsole = (console, endpoint) => {
