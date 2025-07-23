@@ -151,6 +151,26 @@ def prepare_options(task):
     random.shuffle(final)
     return final
 
+def get_protected_prolific_id():
+    """Gibt die geschützte Prolific ID zurück und stellt sicher, dass sie nie korrupt ist"""
+    prolific_id = session.get("prolific_id")
+    if prolific_id and len(str(prolific_id).strip()) >= 6:
+        return str(prolific_id).strip()
+    return None
+
+def set_prolific_id_once(new_id):
+    """Setzt die Prolific ID nur einmal und schützt sie vor Überschreibung"""
+    current_id = get_protected_prolific_id()
+    if current_id is not None:
+        print(f"WARNING: Attempt to overwrite existing prolific_id '{current_id}' with '{new_id}' - BLOCKED!")
+        return False
+    
+    if new_id and len(str(new_id).strip()) >= 6:
+        session["prolific_id"] = str(new_id).strip()
+        print(f"Prolific ID set successfully: {session['prolific_id']}")
+        return True
+    return False
+
 def init_session():
     defaults = {
         "phase": "prolific",
@@ -166,10 +186,13 @@ def init_session():
         "is_first_message": False
     }
     
-    # Nur kleine Daten in Flask Session
+    # Nur kleine Daten in Flask Session - ABER niemals prolific_id überschreiben
     for key, value in defaults.items():
         if key not in session:
             session[key] = value
+        elif key == "prolific_id" and session.get("prolific_id") is not None:
+            # NIEMALS die Prolific ID überschreiben wenn sie bereits gesetzt ist
+            pass
     
     # Große Daten im App-Cache initialisieren
     get_session_cache()  # This creates the cache entry if it doesn't exist
@@ -391,8 +414,22 @@ def save_results(stats):
     cache = get_session_cache()
     record_data = cache.get('record_data', {"records": [], "current_task": None})
     
+    # Use protected Prolific ID function
+    prolific_id = get_protected_prolific_id()
+    
+    # EXTENSIVE LOGGING to track the prolific_id issue
+    print(f"=== SAVE_RESULTS DEBUG ===")
+    print(f"session.get('prolific_id'): '{session.get('prolific_id', 'NONE')}'")
+    print(f"get_protected_prolific_id(): '{prolific_id}'")
+    print(f"session contents: {dict(session)}")
+    print(f"=========================")
+    
+    if not prolific_id:
+        print(f"ERROR: No valid prolific_id found in save_results. Session prolific_id: '{session.get('prolific_id', 'NONE')}'")
+        prolific_id = "INVALID_PROLIFIC_ID"
+    
     final_data = {
-        "prolific_id": session["prolific_id"],
+        "prolific_id": prolific_id,
         "session_id": session["session_id"],
         "group": "treatment" if session["treatment_group"] else "control",
         "statistics": stats,
@@ -402,8 +439,10 @@ def save_results(stats):
     }
     
     try:
-        filename = f'results_{session["prolific_id"]}.json'
+        filename = f'results_{prolific_id}.json'
         filepath = os.path.join("results", filename)
+        
+        print(f"Saving results to: {filename} with prolific_id: {prolific_id}")
         
         os.makedirs("results", exist_ok=True)
         
@@ -413,6 +452,9 @@ def save_results(stats):
         # Asynchroner Upload zu Sciebo
         if webdav_client:
             upload_to_sciebo_async(filepath, filename)
+        
+    except Exception as e:
+        print(f"Error saving results: {e}")
         
     except Exception as e:
         print(f"Error saving results: {e}")
@@ -456,20 +498,23 @@ def upload_to_sciebo(filepath, filename):
 
 def handle_input(user_input):
     if session["phase"] == "prolific":
-        if user_input.strip():
-            session.update({
-                "prolific_id": user_input.strip(),
-                "phase": "questions",
-                "current_phase": "test",
-                "test_idx": 0,
-                "main_idx": 0,
-                "certainty_pending": False
-            })
+        user_input_stripped = user_input.strip()
+        # Validate and set Prolific ID using protected function
+        if set_prolific_id_once(user_input_stripped):
+            session["phase"] = "questions"
+            session["current_phase"] = "test"
+            session["test_idx"] = 0
+            session["main_idx"] = 0
+            session["certainty_pending"] = False
+            
             # Clear results in cache
             update_session_cache({"results": []})
             show_question()
         else:
-            append_left("$  Invalid Prolific ID. Please try again:")
+            if user_input_stripped:
+                append_left(f"$  Invalid Prolific ID '{user_input_stripped}'. Please try again:")
+            else:
+                append_left("$  Invalid Prolific ID. Please try again:")
     
     elif session["phase"] == "waiting":
         show_waiting_phase()
@@ -756,14 +801,23 @@ def command():
         data = request.json or {}
         raw_input = data.get("input", "")
         user_input = raw_input.get("input", "") if isinstance(raw_input, dict) else raw_input
-        user_input = str(user_input).strip().lower()
+        user_input = str(user_input).strip()
+        
+        # NIEMALS die Prolific ID in Kleinbuchstaben umwandeln!
+        # Nur für Antworten (a, b, c, d) und spezielle Kommandos (timeout) umwandeln
+        if session["phase"] == "prolific":
+            # Prolific ID: Originale Groß-/Kleinschreibung beibehalten
+            processed_input = user_input
+        else:
+            # Für alle anderen Eingaben: Kleinbuchstaben für Vergleiche
+            processed_input = user_input.lower()
         
         was_certainty_pending = session.get("certainty_pending", False)
         previous_test_idx = session.get("test_idx", 0)
         previous_main_idx = session.get("main_idx", 0)
         previous_phase = session.get("current_phase", "test")
         
-        handle_input(user_input)
+        handle_input(processed_input)
         
         current_phase = session.get("current_phase", "test")
         current_test_idx = session.get("test_idx", 0)
@@ -787,10 +841,10 @@ def command():
                     timer_duration = remaining / 60
                 else:
                     timer_duration = config.QUESTION_TIME_SECONDS / 60
-                should_reset = was_certainty_pending or user_input == "timeout" or new_question
+                should_reset = was_certainty_pending or processed_input == "timeout" or new_question
             else:
                 timer_duration = config.CERTAINTY_TIME_SECONDS / 60
-                should_reset = (not was_certainty_pending) or user_input == "timeout"
+                should_reset = (not was_certainty_pending) or processed_input == "timeout"
         elif session["phase"] == "waiting":
             elapsed = time.time() - session["waiting_start_time"] if session["waiting_start_time"] else 0
             remaining = max(0, config.WAITING_TIME_SECONDS - elapsed)
@@ -851,6 +905,7 @@ def chat():
                         system_instruction=system_prompt,
                         temperature=0,
                         response_modalities=["TEXT"],
+                        max_output_tokens=2000
                     )
                 )
                 
@@ -860,10 +915,8 @@ def chat():
                 if task and task.get('image_path'):
                     img_path = os.path.join("static", "img", task['image_path'] + ".jpg")
                     uploaded_file = None
-                    if img_path in genai_client.files.list():
-                        uploaded_file = genai_client.files.get(name=img_path)
-                        contents.append(uploaded_file)
-                    elif os.path.exists(img_path):
+
+                    if os.path.exists(img_path):
                         try:
                             uploaded_file = genai_client.files.upload(
                                 file=img_path,
